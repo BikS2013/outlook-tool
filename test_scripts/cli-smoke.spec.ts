@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 // CLI spawns are slower than unit tests; give each test plenty of headroom.
 vi.setConfig({ testTimeout: 60_000 });
 
-const PROJECT_ROOT = '/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool';
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 interface RunOptions {
   env?: NodeJS.ProcessEnv;

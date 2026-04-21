@@ -119,6 +119,7 @@ interface StubClient extends OutlookClient {
   createFolder: ReturnType<typeof vi.fn>;
   moveMessage: ReturnType<typeof vi.fn>;
   listMessagesInFolder: ReturnType<typeof vi.fn>;
+  listMessagesInFolderAll: ReturnType<typeof vi.fn>;
 }
 
 function makeStubClient(): StubClient {
@@ -141,6 +142,11 @@ function makeStubClient(): StubClient {
     listMessagesInFolder: vi.fn(async () => {
       throw new Error(
         'stub: client.listMessagesInFolder not configured for this test',
+      );
+    }),
+    listMessagesInFolderAll: vi.fn(async () => {
+      throw new Error(
+        'stub: client.listMessagesInFolderAll not configured for this test',
       );
     }),
   };
@@ -186,51 +192,48 @@ describe('list-mail folder flag extension (Phase 7)', () => {
   // Default / fast-path branch (no new flag → original behavior preserved)
   // -----------------------------------------------------------------
 
-  it('(1) default (no folder flag) → uses config.listMailFolder via client.get on /MailFolders/Inbox/messages', async () => {
+  it('(1) default (no folder flag) → uses config.listMailFolder via client.listMessagesInFolder', async () => {
     const { deps, client } = makeDeps();
-    const body: ODataListResponse<MessageSummary> = {
-      value: [makeMessage('m1'), makeMessage('m2')],
-    };
-    client.get.mockResolvedValueOnce(body);
+    const messages = [makeMessage('m1'), makeMessage('m2')];
+    client.listMessagesInFolder.mockResolvedValueOnce(messages);
 
     const result = await listMail.run(deps, {});
 
-    expect(result).toEqual(body.value);
-    expect(client.get).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(messages);
+    expect(client.listMessagesInFolder).toHaveBeenCalledTimes(1);
     // Resolver (path) should NOT be taken on the fast path.
     expect(client.listFolders).not.toHaveBeenCalled();
     expect(client.getFolder).not.toHaveBeenCalled();
-    expect(client.listMessagesInFolder).not.toHaveBeenCalled();
+    expect(client.get).not.toHaveBeenCalled();
 
-    const [restPath, query] = client.get.mock.calls[0];
-    expect(restPath).toBe('/api/v2.0/me/MailFolders/Inbox/messages');
-    expect(query).toMatchObject({
-      $top: '10',
-      $orderby: 'ReceivedDateTime desc',
-      $select:
-        'Id,Subject,From,ReceivedDateTime,HasAttachments,IsRead,WebLink',
+    const [folderId, opts] = client.listMessagesInFolder.mock.calls[0];
+    expect(folderId).toBe('Inbox');
+    expect(opts).toMatchObject({
+      top: 10,
+      orderBy: 'ReceivedDateTime desc',
+      select: ['Id', 'Subject', 'From', 'ReceivedDateTime', 'HasAttachments', 'IsRead', 'WebLink'],
     });
   });
 
-  it('(2) --folder Archive (well-known alias) → routes to /MailFolders/Archive/messages via client.get', async () => {
+  it('(2) --folder Archive (well-known alias) → routes via client.listMessagesInFolder with folderId="Archive"', async () => {
     const { deps, client } = makeDeps();
-    client.get.mockResolvedValueOnce({ value: [makeMessage('arch-1')] });
+    client.listMessagesInFolder.mockResolvedValueOnce([makeMessage('arch-1')]);
 
     const result = await listMail.run(deps, { folder: 'Archive' });
 
     expect(result.map((m) => m.Id)).toEqual(['arch-1']);
-    expect(client.get).toHaveBeenCalledTimes(1);
+    expect(client.listMessagesInFolder).toHaveBeenCalledTimes(1);
     expect(client.listFolders).not.toHaveBeenCalled();
     expect(client.getFolder).not.toHaveBeenCalled();
-    expect(client.listMessagesInFolder).not.toHaveBeenCalled();
+    expect(client.get).not.toHaveBeenCalled();
 
-    const [restPath] = client.get.mock.calls[0];
-    expect(restPath).toBe('/api/v2.0/me/MailFolders/Archive/messages');
+    const [folderId] = client.listMessagesInFolder.mock.calls[0];
+    expect(folderId).toBe('Archive');
   });
 
   it('(3) --top and --select are respected on the fast path', async () => {
     const { deps, client } = makeDeps();
-    client.get.mockResolvedValueOnce({ value: [] });
+    client.listMessagesInFolder.mockResolvedValueOnce([]);
 
     await listMail.run(deps, {
       top: 25,
@@ -238,12 +241,12 @@ describe('list-mail folder flag extension (Phase 7)', () => {
       folder: 'SentItems',
     });
 
-    const [restPath, query] = client.get.mock.calls[0];
-    expect(restPath).toBe('/api/v2.0/me/MailFolders/SentItems/messages');
-    expect(query).toMatchObject({
-      $top: '25',
-      $orderby: 'ReceivedDateTime desc',
-      $select: 'Id,Subject',
+    const [folderId, opts] = client.listMessagesInFolder.mock.calls[0];
+    expect(folderId).toBe('SentItems');
+    expect(opts).toMatchObject({
+      top: 25,
+      orderBy: 'ReceivedDateTime desc',
+      select: ['Id', 'Subject'],
     });
   });
 
