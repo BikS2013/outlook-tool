@@ -603,6 +603,13 @@ export async function main(argv: string[]): Promise<number> {
       'Anchor for a path/bare-name in --folder (default MsgFolderRoot)',
     )
     .option('--select <csv>', 'Comma-separated $select fields')
+    .option('--since <iso>',
+      'ISO-8601 UTC: include only messages with ReceivedDateTime >= this')
+    .option('--until <iso>',
+      'ISO-8601 UTC: include only messages with ReceivedDateTime < this')
+    .option('--all', 'Auto-paginate via @odata.nextLink until exhausted', false)
+    .option('--max <N>',
+      'Safety cap for --all (default 10000, max 100000)', parseIntArg)
     .action(
       makeAction<
         {
@@ -611,6 +618,10 @@ export async function main(argv: string[]): Promise<number> {
           folderId?: string;
           folderParent?: string;
           select?: string;
+          since?: string;
+          until?: string;
+          all?: boolean;
+          max?: number;
         },
         []
       >(program, async (deps, g, cmdOpts) => {

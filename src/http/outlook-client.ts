@@ -52,6 +52,16 @@ export interface ListMessagesInFolderOptions {
   select?: string[];
   /** `$orderby` clause, e.g. `'ReceivedDateTime desc'`. */
   orderBy?: string;
+  /** `$filter` clause, e.g. `'ReceivedDateTime ge 2026-04-22T07:00:00Z'`. */
+  filter?: string;
+}
+
+/** Result envelope for the auto-paginating `listMessagesInFolderAll`. */
+export interface ListMessagesInFolderAllResult {
+  /** Collected message summaries (capped at `maxResults`). */
+  messages: MessageSummary[];
+  /** True when the cap was hit and more results were available. */
+  truncated: boolean;
 }
 
 export interface OutlookClient {
@@ -116,6 +126,23 @@ export interface OutlookClient {
     messageId: string,
     destinationFolderId: string,
   ): Promise<MessageSummary>;
+
+  /**
+   * List messages across multiple pages by following `@odata.nextLink`.
+   * Returns up to `maxResults` messages and a `truncated` flag indicating
+   * whether more were available beyond the cap. Defense-in-depth host check
+   * mirrors `listAll` (folders): nextLinks must stay on outlook.office.com.
+   *
+   * @param folderId    Folder id (raw or well-known alias).
+   * @param opts        Same options as `listMessagesInFolder` (top is page size).
+   * @param maxResults  Hard cap on total messages returned; protects against
+   *                    runaway pagination on huge folders.
+   */
+  listMessagesInFolderAll(
+    folderId: string,
+    opts: ListMessagesInFolderOptions,
+    maxResults: number,
+  ): Promise<ListMessagesInFolderAllResult>;
 
   /**
    * List messages inside `folderId` via
@@ -464,15 +491,7 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     }
   }
 
-  async function listMessagesInFolder(
-    folderId: string,
-    opts: ListMessagesInFolderOptions,
-  ): Promise<MessageSummary[]> {
-    if (typeof folderId !== 'string' || folderId.length === 0) {
-      throw new Error(
-        'outlook-client: listMessagesInFolder requires a non-empty folderId',
-      );
-    }
+  function buildMessagesQuery(opts: ListMessagesInFolderOptions): Record<string, QueryValue> {
     const query: Record<string, QueryValue> = {};
     if (typeof opts.top === 'number' && Number.isFinite(opts.top) && opts.top > 0) {
       query.$top = String(Math.floor(opts.top));
@@ -483,6 +502,22 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     if (typeof opts.orderBy === 'string' && opts.orderBy.length > 0) {
       query.$orderby = opts.orderBy;
     }
+    if (typeof opts.filter === 'string' && opts.filter.length > 0) {
+      query.$filter = opts.filter;
+    }
+    return query;
+  }
+
+  async function listMessagesInFolder(
+    folderId: string,
+    opts: ListMessagesInFolderOptions,
+  ): Promise<MessageSummary[]> {
+    if (typeof folderId !== 'string' || folderId.length === 0) {
+      throw new Error(
+        'outlook-client: listMessagesInFolder requires a non-empty folderId',
+      );
+    }
+    const query = buildMessagesQuery(opts);
     const path =
       `/api/v2.0/me/MailFolders/${encodeURIComponent(folderId)}/messages`;
     try {
@@ -493,6 +528,75 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     }
   }
 
+  async function listMessagesInFolderAll(
+    folderId: string,
+    opts: ListMessagesInFolderOptions,
+    maxResults: number,
+  ): Promise<ListMessagesInFolderAllResult> {
+    if (typeof folderId !== 'string' || folderId.length === 0) {
+      throw new Error(
+        'outlook-client: listMessagesInFolderAll requires a non-empty folderId',
+      );
+    }
+    if (!Number.isInteger(maxResults) || maxResults < 1) {
+      throw new Error(
+        `outlook-client: maxResults must be a positive integer (got ${String(maxResults)})`,
+      );
+    }
+    const query = buildMessagesQuery(opts);
+    const path =
+      `/api/v2.0/me/MailFolders/${encodeURIComponent(folderId)}/messages`;
+
+    const messages: MessageSummary[] = [];
+    let url: string | null = buildUrl(path, query);
+    let truncated = false;
+
+    try {
+      while (url !== null && messages.length < maxResults) {
+        // Defense-in-depth: nextLink must stay on outlook.office.com.
+        let parsed: URL;
+        try {
+          parsed = new URL(url);
+        } catch (cause) {
+          throw new UpstreamError({
+            code: 'UPSTREAM_PAGINATION_LIMIT',
+            message: `Malformed @odata.nextLink: ${String(url)}`,
+            cause,
+          });
+        }
+        if (parsed.hostname !== ALLOWED_HOST) {
+          throw new UpstreamError({
+            code: 'UPSTREAM_PAGINATION_LIMIT',
+            message:
+              `@odata.nextLink host '${parsed.hostname}' is not '${ALLOWED_HOST}'.`,
+          });
+        }
+
+        const page: ODataListResponse<MessageSummary> =
+          await doRequest<ODataListResponse<MessageSummary>>('GET', url);
+        const items = Array.isArray(page.value) ? page.value : [];
+        const remaining = maxResults - messages.length;
+        if (items.length > remaining) {
+          messages.push(...items.slice(0, remaining));
+          truncated = page['@odata.nextLink'] !== undefined || items.length > remaining;
+          url = null;
+          break;
+        }
+        messages.push(...items);
+        url = page['@odata.nextLink'] ?? null;
+      }
+      // If we exited because maxResults was reached AND there's still a nextLink,
+      // mark truncated.
+      if (url !== null && messages.length >= maxResults) {
+        truncated = true;
+      }
+    } catch (err) {
+      throw mapHttpToCliError(err);
+    }
+
+    return { messages, truncated };
+  }
+
   return {
     get: doGet,
     listFolders,
@@ -500,6 +604,7 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     createFolder,
     moveMessage,
     listMessagesInFolder,
+    listMessagesInFolderAll,
   };
 }
 

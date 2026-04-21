@@ -15,6 +15,7 @@ import {
   AuthError as HttpAuthError,
   NetworkError,
 } from '../http/errors';
+import { buildReceivedDateFilter, FilterError } from '../http/filter-builder';
 import type { MessageSummary, ODataListResponse } from '../http/types';
 import type { SessionFile } from '../session/schema';
 import { isExpired } from '../session/store';
@@ -35,7 +36,20 @@ export interface ListMailOptions {
   select?: string;
   folderId?: string;
   folderParent?: string;
+  /** ISO-8601 UTC timestamp; include only messages with ReceivedDateTime >= this. */
+  since?: string;
+  /** ISO-8601 UTC timestamp; include only messages with ReceivedDateTime < this. */
+  until?: string;
+  /** When true, walk @odata.nextLink up to `max` results (default 10000). */
+  all?: boolean;
+  /** Hard cap on total results when `all` is true. Defaults to 10000. */
+  max?: number;
 }
+
+/** Default safety cap when --all is set without --max. */
+export const DEFAULT_MAX_RESULTS = 10000;
+/** Absolute hard ceiling — refuses to walk more than this many results in one call. */
+export const ABSOLUTE_MAX_RESULTS = 100_000;
 
 export const ALLOWED_FOLDERS = [
   'Inbox',
@@ -67,6 +81,31 @@ export async function run(
     throw new UsageError(
       `list-mail: --top must be an integer between 1 and 100 (got ${String(top)})`,
     );
+  }
+
+  // Pagination flags (--all / --max). Validate eagerly.
+  const fetchAll = opts.all === true;
+  const maxResults = opts.max ?? DEFAULT_MAX_RESULTS;
+  if (!Number.isInteger(maxResults) || maxResults < 1) {
+    throw new UsageError(
+      `list-mail: --max must be a positive integer (got ${String(maxResults)})`,
+    );
+  }
+  if (maxResults > ABSOLUTE_MAX_RESULTS) {
+    throw new UsageError(
+      `list-mail: --max cannot exceed ${ABSOLUTE_MAX_RESULTS} (got ${String(maxResults)})`,
+    );
+  }
+
+  // Filter clause from --since / --until. validateIso lives inside buildReceivedDateFilter.
+  let filter: string;
+  try {
+    filter = buildReceivedDateFilter(opts.since, opts.until);
+  } catch (err) {
+    if (err instanceof FilterError) {
+      throw new UsageError(`list-mail: ${err.message}`);
+    }
+    throw err;
   }
 
   // Additive flags (§10.7):
@@ -111,69 +150,61 @@ export async function run(
   const session = await ensureSession(deps);
   const client = deps.createClient(session);
 
+  const selectArr = select.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  const listOpts = {
+    top,
+    select: selectArr,
+    orderBy: 'ReceivedDateTime desc',
+    filter: filter.length > 0 ? filter : undefined,
+  };
+
+  // Resolve the target folderId via one of three paths.
   // Path A: --folder-id → use the id verbatim (no resolver hop).
+  // Path B (fast path): well-known alias used verbatim in URL.
+  // Path C (resolver): path form, non-fast-path alias, or anchored bare name.
+  let targetFolderId: string;
   if (hasFolderId) {
-    try {
-      return await client.listMessagesInFolder(opts.folderId as string, {
-        top,
-        select: select.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
-        orderBy: 'ReceivedDateTime desc',
-      });
-    } catch (err) {
-      throw mapHttpError(err);
+    targetFolderId = opts.folderId as string;
+  } else {
+    const folder = hasFolder ? (opts.folder as string) : deps.config.listMailFolder;
+    const isFastPathAlias = (ALLOWED_FOLDERS as readonly string[]).includes(folder);
+    if (isFastPathAlias && !hasFolderParent) {
+      // Fast-path alias: pass verbatim. listMessagesInFolder URL-encodes it.
+      targetFolderId = folder;
+    } else {
+      // Path C — resolver
+      try {
+        const spec = parseFolderSpec(folder);
+        const finalSpec =
+          spec.kind === 'path' && hasFolderParent
+            ? { ...spec, parent: parseFolderSpec(opts.folderParent as string) }
+            : spec;
+        const resolved = await resolveFolder(client, finalSpec);
+        targetFolderId = resolved.Id;
+      } catch (err) {
+        throw mapHttpError(err);
+      }
     }
   }
 
-  // Effective --folder value (falls back to CliConfig.listMailFolder = "Inbox").
-  const folder = hasFolder ? (opts.folder as string) : deps.config.listMailFolder;
-
-  // Path B (fast path): the value is one of the original five well-known
-  // aliases (Inbox, SentItems, Drafts, DeletedItems, Archive). No resolver
-  // hop — the alias is sent verbatim in the URL path, preserving the exact
-  // request shape used before the folder feature landed.
-  const isFastPathAlias = (ALLOWED_FOLDERS as readonly string[]).includes(folder);
-  if (isFastPathAlias && !hasFolderParent) {
-    const restPath = `/api/v2.0/me/MailFolders/${encodeURIComponent(folder)}/messages`;
-    const query = {
-      $top: String(top),
-      $orderby: 'ReceivedDateTime desc',
-      $select: select,
-    };
-
-    try {
-      const resp = await client.get<ODataListResponse<MessageSummary>>(
-        restPath,
-        query,
+  // Single dispatch point: paginate or single-page based on --all.
+  try {
+    if (fetchAll) {
+      const result = await client.listMessagesInFolderAll(
+        targetFolderId,
+        listOpts,
+        maxResults,
       );
-      return Array.isArray(resp.value) ? resp.value : [];
-    } catch (err) {
-      throw mapHttpError(err);
+      if (result.truncated) {
+        process.stderr.write(JSON.stringify({
+          code: 'max_results_reached',
+          message: `--max=${maxResults} cap hit; ${result.messages.length} returned, more available`,
+          hint: 'increase --max or split query with --since/--until',
+        }) + '\n');
+      }
+      return result.messages;
     }
-  }
-
-  // Path C (resolver): the value is a path (Inbox/Projects/...), a non-
-  // fast-path well-known alias (JunkEmail / Outbox / MsgFolderRoot /
-  // RecoverableItemsDeletions), or a bare name anchored by --folder-parent.
-  let resolvedId: string;
-  try {
-    const spec = parseFolderSpec(folder);
-    // Attach the anchor only when meaningful (path form).
-    const finalSpec =
-      spec.kind === 'path' && hasFolderParent
-        ? { ...spec, parent: parseFolderSpec(opts.folderParent as string) }
-        : spec;
-    const resolved = await resolveFolder(client, finalSpec);
-    resolvedId = resolved.Id;
-  } catch (err) {
-    throw mapHttpError(err);
-  }
-
-  try {
-    return await client.listMessagesInFolder(resolvedId, {
-      top,
-      select: select.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
-      orderBy: 'ReceivedDateTime desc',
-    });
+    return await client.listMessagesInFolder(targetFolderId, listOpts);
   } catch (err) {
     throw mapHttpError(err);
   }
