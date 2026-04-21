@@ -12,7 +12,9 @@ import * as fs from 'node:fs';
 import { chromium, BrowserContext, Page } from 'playwright';
 
 import { Cookie } from '../session/schema';
+import type { SharepointSession } from '../session/sharepoint-schema';
 import { decodeJwt, JwtClaims } from './jwt';
+import { captureSharepointFromContext } from './sharepoint-capture';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -37,6 +39,9 @@ export interface CaptureResult {
   };
   /** Pre-computed "PUID:<puid>@<tenantId>". */
   anchorMailbox: string;
+  /** When CaptureOptions.sharepointHost is set, the SharePoint session
+   *  captured from the same persistent context after Outlook auth. */
+  sharepoint?: SharepointSession;
 }
 
 export interface CaptureOptions {
@@ -48,6 +53,10 @@ export interface CaptureOptions {
   loginTimeoutMs: number;
   /** When true, the browser opens even if a cached profile could do silent SSO. */
   force?: boolean;
+  /** When set, capture a SharePoint session from the same persistent context
+   *  after Outlook auth succeeds. Host must end in ".sharepoint.com" — see
+   *  captureSharepointFromContext for validation. */
+  sharepointHost?: string;
 }
 
 export type AuthCaptureErrorCode =
@@ -376,11 +385,24 @@ export async function captureOutlookSession(
     const account = { upn, puid, tenantId };
     const anchorMailbox = `PUID:${account.puid}@${account.tenantId}`;
 
+    // 14b. Optionally capture SharePoint session from the same context
+    // before teardown. Failure here is non-fatal for the Outlook part —
+    // we surface it as an error if it fails, since the caller asked for it.
+    let sharepointSession: SharepointSession | undefined;
+    if (opts.sharepointHost && opts.sharepointHost.length > 0) {
+      sharepointSession = await captureSharepointFromContext(
+        context,
+        opts.sharepointHost,
+        opts.loginTimeoutMs,
+      );
+    }
+
     return {
       bearer: { token: jwt, expiresAt, audience, scopes },
       cookies,
       account,
       anchorMailbox,
+      sharepoint: sharepointSession,
     };
   } finally {
     // 15. Always close the context — even on error, even on cancellation.

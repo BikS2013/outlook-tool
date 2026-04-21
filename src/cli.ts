@@ -82,6 +82,12 @@ interface CommandDeps {
   loadSession: (p: string) => Promise<SessionFile | null>;
   saveSession: (p: string, s: SessionFile) => Promise<void>;
   doAuthCapture: () => Promise<SessionFile>;
+  /** Like doAuthCapture but also captures + persists a SharePoint session
+   *  from the same Playwright context. Used by `login --sharepoint-host`. */
+  doAuthCaptureWithSharepoint: (host: string) => Promise<{
+    session: SessionFile;
+    sharepointPath: string;
+  }>;
   createClient: (s: SessionFile) => OutlookClient;
 }
 
@@ -113,6 +119,31 @@ function buildDeps(globalFlags: CliFlags): CommandDeps {
     return sessionFile;
   };
 
+  // SharePoint-aware variant. Captures both Outlook + SharePoint from the
+  // same persistent context, then persists each file independently.
+  const doAuthCaptureWithSharepoint = async (
+    host: string,
+  ): Promise<{ session: SessionFile; sharepointPath: string }> => {
+    const captured = await captureOutlookSession({
+      profileDir: config.profileDir,
+      chromeChannel: config.chromeChannel,
+      loginTimeoutMs: config.loginTimeoutMs,
+      sharepointHost: host,
+    });
+    const sessionFile = captureToSessionFile(captured);
+    await saveSession(sessionPath, sessionFile);
+    if (!captured.sharepoint) {
+      throw new Error(
+        `captureOutlookSession returned no sharepoint session for host "${host}"`,
+      );
+    }
+    const { defaultSharepointSessionPath, saveSharepointSession } =
+      await import('./session/sharepoint-schema');
+    const sharepointPath = defaultSharepointSessionPath();
+    await saveSharepointSession(sharepointPath, captured.sharepoint);
+    return { session: sessionFile, sharepointPath };
+  };
+
   const createClient = (s: SessionFile): OutlookClient =>
     createOutlookClient({
       session: s,
@@ -127,6 +158,7 @@ function buildDeps(globalFlags: CliFlags): CommandDeps {
     loadSession,
     saveSession,
     doAuthCapture,
+    doAuthCaptureWithSharepoint,
     createClient,
   };
 }
@@ -567,11 +599,21 @@ export async function main(argv: string[]): Promise<number> {
     .command('login')
     .description('Open Chrome and capture a fresh Outlook session')
     .option('--force', 'Ignore any cached session and always open the browser', false)
+    .option(
+      '--sharepoint-host <host>',
+      'After Outlook login, also capture a SharePoint session for this host (e.g. nbg.sharepoint.com)',
+    )
     .action(
-      makeAction<{ force?: boolean }, []>(program, async (deps, g, cmdOpts) => {
-        const result = await login.run(deps, { force: cmdOpts.force === true });
-        emitResult(result, resolveOutputMode(g));
-      }),
+      makeAction<{ force?: boolean; sharepointHost?: string }, []>(
+        program,
+        async (deps, g, cmdOpts) => {
+          const result = await login.run(deps, {
+            force: cmdOpts.force === true,
+            sharepointHost: cmdOpts.sharepointHost,
+          });
+          emitResult(result, resolveOutputMode(g));
+        },
+      ),
     );
 
   // -------- auth-check --------

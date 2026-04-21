@@ -17,11 +17,19 @@ export interface LoginDeps {
   loadSession: (path: string) => Promise<SessionFile | null>;
   saveSession: (path: string, s: SessionFile) => Promise<void>;
   doAuthCapture: () => Promise<SessionFile>;
+  /** Optional — required only when LoginOptions.sharepointHost is set. */
+  doAuthCaptureWithSharepoint?: (host: string) => Promise<{
+    session: SessionFile;
+    sharepointPath: string;
+  }>;
   createClient: (s: SessionFile) => OutlookClient;
 }
 
 export interface LoginOptions {
   force?: boolean;
+  /** When set, also capture a SharePoint session for this host
+   *  (e.g. "nbg.sharepoint.com") into ~/.outlook-cli/sharepoint-session.json. */
+  sharepointHost?: string;
 }
 
 export interface LoginResult {
@@ -33,13 +41,19 @@ export interface LoginResult {
     puid: string;
     tenantId: string;
   };
+  /** Path to the persisted SharePoint session file when --sharepoint-host was set. */
+  sharepointSessionFile?: string;
 }
 
 function buildLockPath(sessionPath: string): string {
   return path.join(path.dirname(sessionPath), '.browser.lock');
 }
 
-function toResult(session: SessionFile, sessionFile: string): LoginResult {
+function toResult(
+  session: SessionFile,
+  sessionFile: string,
+  sharepointSessionFile?: string,
+): LoginResult {
   return {
     status: 'ok',
     sessionFile,
@@ -49,6 +63,7 @@ function toResult(session: SessionFile, sessionFile: string): LoginResult {
       puid: session.account.puid,
       tenantId: session.account.tenantId,
     },
+    ...(sharepointSessionFile ? { sharepointSessionFile } : {}),
   };
 }
 
@@ -58,8 +73,11 @@ export async function run(
 ): Promise<LoginResult> {
   const force = opts.force === true;
 
-  // Step 2: reuse cached session when allowed.
-  if (!force) {
+  const sharepointHost = opts.sharepointHost;
+
+  // Step 2: reuse cached session when allowed (skip when --sharepoint-host —
+  // we always need to open the browser for the SharePoint capture leg).
+  if (!force && !sharepointHost) {
     const cached = await deps.loadSession(deps.sessionPath);
     if (cached !== null && !isExpired(cached)) {
       return toResult(cached, path.resolve(deps.sessionPath));
@@ -71,16 +89,24 @@ export async function run(
   const release = await acquireLock(lockPath);
 
   try {
-    // Step 3 + 4: run the Playwright capture and build the SessionFile.
-    // doAuthCapture is injected by cli.ts; it wraps captureOutlookSession and
-    // attaches `version` + `capturedAt` to produce a fully-formed SessionFile.
+    if (sharepointHost) {
+      if (!deps.doAuthCaptureWithSharepoint) {
+        throw new Error(
+          'login: --sharepoint-host was set but doAuthCaptureWithSharepoint is not wired',
+        );
+      }
+      const { session, sharepointPath } =
+        await deps.doAuthCaptureWithSharepoint(sharepointHost);
+      // saveSession is also called inside doAuthCaptureWithSharepoint, but we
+      // re-call it here to keep the contract symmetric with the non-SharePoint
+      // path. Atomic write is idempotent.
+      await deps.saveSession(deps.sessionPath, session);
+      return toResult(session, path.resolve(deps.sessionPath), sharepointPath);
+    }
+
+    // Standard Outlook-only path
     const session = await deps.doAuthCapture();
-
-    // Step 5: persist atomically (mode 0600).
     await deps.saveSession(deps.sessionPath, session);
-
-    // Step 7: return the response shape. (Step 6 — lock release — happens in
-    // the `finally` block below.)
     return toResult(session, path.resolve(deps.sessionPath));
   } finally {
     try {
