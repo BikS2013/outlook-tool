@@ -256,7 +256,25 @@ outlook-cli get-mail AAMkAGI... --body text > message.json
 
 # Save all non-inline attachments to ./att
 outlook-cli download-attachments AAMkAGI... --out ./att
+
+# Incremental sync: every message received in the last 24h, paginated
+outlook-cli list-mail \
+  --folder Inbox \
+  --since "$(date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)" \
+  --all --max 5000 --json
+
+# A specific date range, all pages
+outlook-cli list-mail \
+  --since 2026-04-01T00:00:00Z \
+  --until 2026-04-08T00:00:00Z \
+  --all --json
 ```
+
+`--since`/`--until` add a server-side `$filter` on `ReceivedDateTime`.
+`--all` walks `@odata.nextLink` until exhausted; `--max <N>` is the
+safety cap (default 10000, max 100000). When the cap is hit and more
+results remain, a `max_results_reached` warning is emitted on stderr and
+the partial result is returned.
 
 ### Calendar
 
@@ -288,6 +306,35 @@ outlook-cli move-mail AAMk... AAMk... --to "Inbox/Archive-2026"
 outlook-cli move-mail AAMk... --to Archive
 outlook-cli move-mail AAMk... --to "id:AAMkAGI..." --continue-on-error
 ```
+
+### SharePoint reference attachments
+
+Some Outlook messages include `ReferenceAttachment` entries — these are
+SharePoint or OneDrive-for-Business shared-link "attachments" rather
+than inline binaries. Their content lives on a different host
+(`<tenant>.sharepoint.com`), which uses different cookies and a
+different Bearer token from outlook.office.com.
+
+To fetch them, capture a SharePoint session at login time:
+
+```bash
+# Capture both Outlook and SharePoint sessions in one login flow
+outlook-cli login --sharepoint-host nbg.sharepoint.com
+```
+
+This writes a second session file to `~/.outlook-cli/sharepoint-session.json`
+(mode 0600). Then download a referenced URL:
+
+```bash
+# Fetch a URL surfaced by get-mail's Attachments[].SourceUrl
+outlook-cli download-sharepoint-link \
+  "https://nbg.sharepoint.com/sites/foo/Documents/report.pdf" \
+  --out ./att
+```
+
+If the SharePoint session file is missing or expired, the command exits
+with code 4 (auth failure) and prints the exact `outlook-cli login`
+command to recover.
 
 ### List mail from an arbitrary folder
 
