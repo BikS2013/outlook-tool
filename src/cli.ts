@@ -50,6 +50,7 @@ import * as login from './commands/login';
 import * as listMail from './commands/list-mail';
 import * as getMail from './commands/get-mail';
 import * as downloadAttachments from './commands/download-attachments';
+import * as downloadSharepointLink from './commands/download-sharepoint-link';
 import * as listCalendar from './commands/list-calendar';
 import * as getEvent from './commands/get-event';
 import * as listFolders from './commands/list-folders';
@@ -708,6 +709,27 @@ export async function main(argv: string[]): Promise<number> {
         const result = await downloadAttachments.run(deps, id, cmdOpts);
         emitResult(result, resolveOutputMode(g));
       }),
+    );
+
+  // -------- download-sharepoint-link <url> --------
+  program
+    .command('download-sharepoint-link')
+    .argument('<url>', 'SharePoint URL (typically from a ReferenceAttachment.SourceUrl)')
+    .description('Fetch a SharePoint URL using the captured SharePoint session')
+    .option('--out <dir>', 'Output directory (no default — must be provided)')
+    .option('--overwrite', 'Overwrite existing files', false)
+    .action(
+      makeAction<{ out?: string; overwrite?: boolean }, [string]>(
+        program,
+        async (deps, g, cmdOpts, url) => {
+          const result = await downloadSharepointLink.run(
+            { httpTimeoutMs: deps.config.httpTimeoutMs },
+            url,
+            cmdOpts,
+          );
+          emitResult(result, resolveOutputMode(g));
+        },
+      ),
     );
 
   // -------- list-calendar --------
