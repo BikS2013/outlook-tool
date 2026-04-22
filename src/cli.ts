@@ -676,6 +676,10 @@ export async function main(argv: string[]): Promise<number> {
       'ISO-8601 UTC: include only messages with ReceivedDateTime >= this')
     .option('--until <iso>',
       'ISO-8601 UTC: include only messages with ReceivedDateTime < this')
+    .option('--from <iso|keyword>',
+      'Lower bound (ge) on ReceivedDateTime. ISO-8601 or now / now+Nd / now-Nd. Mutually exclusive with --since.')
+    .option('--to <iso|keyword>',
+      'Upper bound (lt) on ReceivedDateTime. Same grammar as --from. Mutually exclusive with --until.')
     .option('--all', 'Auto-paginate via @odata.nextLink until exhausted', false)
     .option('--max <N>',
       'Safety cap for --all (default 10000, max 100000)', parseIntArg)
@@ -689,6 +693,8 @@ export async function main(argv: string[]): Promise<number> {
           select?: string;
           since?: string;
           until?: string;
+          from?: string;
+          to?: string;
           all?: boolean;
           max?: number;
         },

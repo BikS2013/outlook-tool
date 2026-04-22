@@ -20,6 +20,7 @@ import type { MessageSummary, ODataListResponse } from '../http/types';
 import type { SessionFile } from '../session/schema';
 import { isExpired } from '../session/store';
 import { parseFolderSpec, resolveFolder } from '../folders/resolver';
+import { parseTimestamp } from '../util/dates';
 
 export interface ListMailDeps {
   config: CliConfig;
@@ -40,6 +41,17 @@ export interface ListMailOptions {
   since?: string;
   /** ISO-8601 UTC timestamp; include only messages with ReceivedDateTime < this. */
   until?: string;
+  /**
+   * Lower bound (inclusive, `ge`) on ReceivedDateTime. Accepts ISO-8601 or
+   * the keyword grammar `now` / `now + Nd` / `now - Nd`. Mutually exclusive
+   * with `--since`.
+   */
+  from?: string;
+  /**
+   * Upper bound (exclusive, `lt`) on ReceivedDateTime. Same grammar as
+   * `--from`. Mutually exclusive with `--until`.
+   */
+  to?: string;
   /** When true, walk @odata.nextLink up to `max` results (default 10000). */
   all?: boolean;
   /** Hard cap on total results when `all` is true. Defaults to 10000. */
@@ -97,15 +109,34 @@ export async function run(
     );
   }
 
-  // Filter clause from --since / --until. validateIso lives inside buildReceivedDateFilter.
+  // Mutually exclusive: --since/--until (legacy) vs --from/--to (v1.2.0+).
+  const hasSinceUntil =
+    (typeof opts.since === 'string' && opts.since.length > 0) ||
+    (typeof opts.until === 'string' && opts.until.length > 0);
+  const hasFromTo =
+    (typeof opts.from === 'string' && opts.from.length > 0) ||
+    (typeof opts.to === 'string' && opts.to.length > 0);
+  if (hasSinceUntil && hasFromTo) {
+    throw new UsageError(
+      'list-mail: --since/--until and --from/--to are mutually exclusive ' +
+        '(prefer --from/--to which accepts the now/now±Nd keyword grammar).',
+    );
+  }
+
+  // Filter clause: prefer --from/--to (parseTimestamp), fall back to legacy
+  // --since/--until (buildReceivedDateFilter from filter-builder module).
   let filter: string;
-  try {
-    filter = buildReceivedDateFilter(opts.since, opts.until);
-  } catch (err) {
-    if (err instanceof FilterError) {
-      throw new UsageError(`list-mail: ${err.message}`);
+  if (hasFromTo) {
+    filter = buildFromToFilter(opts.from, opts.to);
+  } else {
+    try {
+      filter = buildReceivedDateFilter(opts.since, opts.until);
+    } catch (err) {
+      if (err instanceof FilterError) {
+        throw new UsageError(`list-mail: ${err.message}`);
+      }
+      throw err;
     }
-    throw err;
   }
 
   // Additive flags (§10.7):
@@ -275,4 +306,40 @@ export function mapHttpError(err: unknown): unknown {
     });
   }
   return err;
+}
+
+/**
+ * Build a `$filter=ReceivedDateTime ge X and ReceivedDateTime lt Y` expression
+ * from `--from` / `--to` inputs (each accepting ISO-8601 or the keyword
+ * grammar `now` / `now + Nd` / `now - Nd`). Returns `''` when both bounds
+ * are unset. Raises `UsageError` when either bound is malformed.
+ *
+ * Convention: lower bound is INCLUSIVE (`ge`), upper bound is EXCLUSIVE
+ * (`lt`), matching the calendar-view convention.
+ */
+function buildFromToFilter(
+  from: string | undefined,
+  to: string | undefined,
+): string {
+  const hasFrom = typeof from === 'string' && from.length > 0;
+  const hasTo = typeof to === 'string' && to.length > 0;
+  if (!hasFrom && !hasTo) {
+    return '';
+  }
+  const parts: string[] = [];
+  if (hasFrom) {
+    const r = parseTimestamp(from as string);
+    if (!r.ok) {
+      throw new UsageError(`list-mail: --from is ${r.reason}`);
+    }
+    parts.push(`ReceivedDateTime ge ${r.iso}`);
+  }
+  if (hasTo) {
+    const r = parseTimestamp(to as string);
+    if (!r.ok) {
+      throw new UsageError(`list-mail: --to is ${r.reason}`);
+    }
+    parts.push(`ReceivedDateTime lt ${r.iso}`);
+  }
+  return parts.join(' and ');
 }
