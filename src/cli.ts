@@ -49,6 +49,7 @@ import * as authCheck from './commands/auth-check';
 import * as login from './commands/login';
 import * as listMail from './commands/list-mail';
 import * as getMail from './commands/get-mail';
+import * as getThread from './commands/get-thread';
 import * as downloadAttachments from './commands/download-attachments';
 import * as downloadSharepointLink from './commands/download-sharepoint-link';
 import * as listCalendar from './commands/list-calendar';
@@ -271,6 +272,31 @@ const LIST_MAIL_COLUMNS: ColumnSpec<MessageSummary>[] = [
     // No maxWidth: IDs must never be truncated, otherwise copy-paste into
     // `get-mail`/`download-attachments` sends an ellipsis character instead
     // of the real bytes and the server returns ErrorInvalidIdMalformed.
+  },
+];
+
+const GET_THREAD_COLUMNS: ColumnSpec<MessageSummary>[] = [
+  {
+    header: 'Received',
+    extract: (r) => r.ReceivedDateTime ?? '',
+    maxWidth: 20,
+  },
+  {
+    header: 'From',
+    extract: (r) =>
+      r.From?.EmailAddress?.Name ||
+      r.From?.EmailAddress?.Address ||
+      '',
+    maxWidth: 28,
+  },
+  {
+    header: 'Subject',
+    extract: (r) => r.Subject ?? '',
+    maxWidth: 56,
+  },
+  {
+    header: 'Id',
+    extract: (r) => r.Id ?? '',
   },
 ];
 
@@ -691,6 +717,43 @@ export async function main(argv: string[]): Promise<number> {
           emitResult(result, resolveOutputMode(g));
         },
       ),
+    );
+
+  // -------- get-thread <id> --------
+  program
+    .command('get-thread')
+    .argument(
+      '<id>',
+      'Message id (or "conv:<conversationId>" to skip the resolve hop)',
+    )
+    .description(
+      'Retrieve every message in a conversation (thread) regardless of folder',
+    )
+    .option(
+      '--body <mode>',
+      'Body inclusion: html|text|none (default text)',
+    )
+    .option(
+      '--order <asc|desc>',
+      'ReceivedDateTime order (default asc = oldest first)',
+    )
+    .action(
+      makeAction<
+        { body?: getThread.ThreadBodyMode; order?: getThread.ThreadOrder },
+        [string]
+      >(program, async (deps, g, cmdOpts, id) => {
+        const result = await getThread.run(deps, id, cmdOpts);
+        const mode = resolveOutputMode(g);
+        if (mode === 'table') {
+          emitResult(
+            result.messages,
+            mode,
+            GET_THREAD_COLUMNS as unknown as ColumnSpec<unknown>[],
+          );
+        } else {
+          emitResult(result, mode);
+        }
+      }),
     );
 
   // -------- download-attachments <id> --------
