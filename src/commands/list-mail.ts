@@ -19,6 +19,7 @@ import type { MessageSummary, ODataListResponse } from '../http/types';
 import type { SessionFile } from '../session/schema';
 import { isExpired } from '../session/store';
 import { parseFolderSpec, resolveFolder } from '../folders/resolver';
+import { parseTimestamp } from '../util/dates';
 
 export interface ListMailDeps {
   config: CliConfig;
@@ -35,6 +36,23 @@ export interface ListMailOptions {
   select?: string;
   folderId?: string;
   folderParent?: string;
+  /** Lower bound (inclusive) on ReceivedDateTime. ISO8601 or "now"/"now±Nd". */
+  from?: string;
+  /** Upper bound (exclusive) on ReceivedDateTime. ISO8601 or "now"/"now±Nd". */
+  to?: string;
+  /**
+   * When true, return just the count of matching messages (server-side via
+   * `$count=true`) instead of the messages themselves. Ignores `--top`
+   * and `--select`. Works alongside every folder flag and the `--from`/`--to`
+   * date window.
+   */
+  justCount?: boolean;
+}
+
+/** Result shape returned by `run()` when `--just-count` is set. */
+export interface ListMailCountResult {
+  count: number;
+  exact: boolean;
 }
 
 export const ALLOWED_FOLDERS = [
@@ -60,12 +78,15 @@ export class UsageError extends OutlookCliError {
 export async function run(
   deps: ListMailDeps,
   opts: ListMailOptions = {},
-): Promise<MessageSummary[]> {
+): Promise<MessageSummary[] | ListMailCountResult> {
+  const justCount = opts.justCount === true;
+
   // Resolve effective option values (fall back to CliConfig defaults).
+  // Skip --top validation in count mode — the flag is ignored there.
   const top = typeof opts.top === 'number' ? opts.top : deps.config.listMailTop;
-  if (!Number.isInteger(top) || top < 1 || top > 100) {
+  if (!justCount && (!Number.isInteger(top) || top < 1 || top > 1000)) {
     throw new UsageError(
-      `list-mail: --top must be an integer between 1 and 100 (got ${String(top)})`,
+      `list-mail: --top must be an integer between 1 and 1000 (got ${String(top)})`,
     );
   }
 
@@ -106,6 +127,11 @@ export async function run(
       ? opts.select
       : DEFAULT_SELECT;
 
+  // Optional date window (--from / --to). Each bound independently resolves
+  // to an ISO8601 UTC timestamp; the server is queried with `ge` / `lt` for
+  // an inclusive-lower, exclusive-upper window. Either bound may be omitted.
+  const filter = buildReceivedDateFilter(opts.from, opts.to);
+
   // Session load. If missing/expired and auto-reauth is allowed, capture a
   // fresh session before we build the client.
   const session = await ensureSession(deps);
@@ -114,10 +140,16 @@ export async function run(
   // Path A: --folder-id → use the id verbatim (no resolver hop).
   if (hasFolderId) {
     try {
+      if (justCount) {
+        return await client.countMessagesInFolder(opts.folderId as string, {
+          filter,
+        });
+      }
       return await client.listMessagesInFolder(opts.folderId as string, {
         top,
         select: select.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
         orderBy: 'ReceivedDateTime desc',
+        filter,
       });
     } catch (err) {
       throw mapHttpError(err);
@@ -133,12 +165,22 @@ export async function run(
   // request shape used before the folder feature landed.
   const isFastPathAlias = (ALLOWED_FOLDERS as readonly string[]).includes(folder);
   if (isFastPathAlias && !hasFolderParent) {
+    if (justCount) {
+      try {
+        return await client.countMessagesInFolder(folder, { filter });
+      } catch (err) {
+        throw mapHttpError(err);
+      }
+    }
     const restPath = `/api/v2.0/me/MailFolders/${encodeURIComponent(folder)}/messages`;
-    const query = {
+    const query: Record<string, string> = {
       $top: String(top),
       $orderby: 'ReceivedDateTime desc',
       $select: select,
     };
+    if (typeof filter === 'string' && filter.length > 0) {
+      query.$filter = filter;
+    }
 
     try {
       const resp = await client.get<ODataListResponse<MessageSummary>>(
@@ -169,14 +211,54 @@ export async function run(
   }
 
   try {
+    if (justCount) {
+      return await client.countMessagesInFolder(resolvedId, { filter });
+    }
     return await client.listMessagesInFolder(resolvedId, {
       top,
       select: select.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
       orderBy: 'ReceivedDateTime desc',
+      filter,
     });
   } catch (err) {
     throw mapHttpError(err);
   }
+}
+
+/**
+ * Build a `$filter=ReceivedDateTime ge X and ReceivedDateTime lt Y` expression
+ * from `--from` / `--to` inputs. Returns `undefined` when both bounds are
+ * unset. Raises `UsageError` when either bound is malformed.
+ *
+ * Convention: lower bound is INCLUSIVE (`ge`), upper bound is EXCLUSIVE
+ * (`lt`), matching the calendar-view convention and allowing day-aligned
+ * windows to be specified without overlap.
+ */
+function buildReceivedDateFilter(
+  from: string | undefined,
+  to: string | undefined,
+): string | undefined {
+  const hasFrom = typeof from === 'string' && from.length > 0;
+  const hasTo = typeof to === 'string' && to.length > 0;
+  if (!hasFrom && !hasTo) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (hasFrom) {
+    const r = parseTimestamp(from);
+    if (!r.ok) {
+      throw new UsageError(`list-mail: --from is ${r.reason}`);
+    }
+    parts.push(`ReceivedDateTime ge ${r.iso}`);
+  }
+  if (hasTo) {
+    const r = parseTimestamp(to);
+    if (!r.ok) {
+      throw new UsageError(`list-mail: --to is ${r.reason}`);
+    }
+    parts.push(`ReceivedDateTime lt ${r.iso}`);
+  }
+  return parts.join(' and ');
 }
 
 // ---------------------------------------------------------------------------

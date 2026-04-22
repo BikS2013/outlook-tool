@@ -258,6 +258,49 @@ outlook-cli get-mail AAMkAGI... --body text > message.json
 outlook-cli download-attachments AAMkAGI... --out ./att
 ```
 
+### Mail received between two timestamps
+
+`list-mail` supports `--from` / `--to` for a ReceivedDateTime window.
+Each bound accepts ISO8601 or the keyword grammar `now` / `now + Nd` /
+`now - Nd`. Lower bound is inclusive, upper bound is exclusive — so
+day-aligned windows do not overlap.
+
+```bash
+# Everything received in the last 7 days
+outlook-cli list-mail --from "now - 7d" --table
+
+# Absolute window (one calendar month)
+outlook-cli list-mail --from 2026-04-01T00:00:00Z --to 2026-05-01T00:00:00Z --top 100
+
+# Combine with folder selection
+outlook-cli list-mail --folder "Inbox/Projects/Alpha" \
+                      --from "now - 30d" --top 50
+
+# Just the count of matching messages (no payload, server-side $count)
+outlook-cli list-mail --just-count
+outlook-cli list-mail --folder Archive --from "now - 365d" --just-count
+# → { "count": 4273, "exact": true }
+```
+
+### Full thread of an email
+
+`get-thread` walks the `ConversationId` of a message and returns every
+message in that conversation regardless of folder.
+
+```bash
+# From a known message id — fetches ConversationId first, then the whole thread
+outlook-cli get-thread AAMkAGI...
+
+# Table view, oldest-first
+outlook-cli get-thread AAMkAGI... --table
+
+# Newest-first, body omitted for a compact JSON dump
+outlook-cli get-thread AAMkAGI... --order desc --body none > thread.json
+
+# If you already have the conversation id, skip the first hop
+outlook-cli get-thread "conv:AAQkAGI..."
+```
+
 ### Calendar
 
 ```bash
@@ -342,6 +385,13 @@ docs/
 Every meaningful behavior is documented in
 [`docs/design/project-design.md`](docs/design/project-design.md), and every
 phase of work has a `plan-NNN-*.md` alongside it.
+
+---
+
+## What's new
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the release history. Current version is
+recorded in `package.json`.
 
 ---
 

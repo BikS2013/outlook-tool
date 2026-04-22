@@ -155,10 +155,10 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
              in the payload).
            - Output: `{status: "ok"|"expired"|"missing"|"rejected", tokenExpiresAt, account}`.
 
-        3. `list-mail [-n <N>] [--folder <name>] [--folder-id <id>] [--folder-parent <anchor>] [--select <csv>]`
+        3. `list-mail [-n <N>] [--folder <name>] [--folder-id <id>] [--folder-parent <anchor>] [--select <csv>] [--from <iso|keyword>] [--to <iso|keyword>] [--just-count]`
            - Lists recent messages from a folder (well-known alias, display-name
-             path, or raw id).
-           - `--top N`           1..100 (default 10).
+             path, or raw id), optionally filtered by a ReceivedDateTime window.
+           - `--top N`           1..1000 (default 10).
            - `--folder`          One of `Inbox`, `SentItems`, `Drafts`,
                                  `DeletedItems`, `Archive` (original fast path,
                                  no resolver hop) OR any other well-known alias
@@ -176,8 +176,25 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
                                  `--folder`) → exit 2.
            - `--select`          Comma-separated $select fields. Default:
                                  `Id,Subject,From,ReceivedDateTime,HasAttachments,IsRead,WebLink`.
-           - JSON: array of `MessageSummary`.
-           - Table columns: `Received | From | Subject | Att | Id`.
+           - `--from <iso|kw>`   Lower bound on `ReceivedDateTime` (inclusive).
+                                 Accepts ISO8601 OR `now` / `now + Nd` /
+                                 `now - Nd`. Omitted → no lower bound.
+           - `--to <iso|kw>`     Upper bound on `ReceivedDateTime` (exclusive).
+                                 Same grammar as `--from`. Omitted → no upper
+                                 bound. Either, both, or neither may be set.
+                                 Malformed values → exit 2.
+           - `--just-count`      Return ONLY the count of matching messages
+                                 (server-side via `$count=true`) instead of
+                                 the messages themselves. Ignores `--top` and
+                                 `--select`. Works with every folder flag and
+                                 the `--from`/`--to` window. Output becomes
+                                 `{ count: <int>, exact: <bool> }`;
+                                 `exact: false` means the server did not
+                                 return `@odata.count` and the count reflects
+                                 only the first page.
+           - JSON: array of `MessageSummary` (default) OR
+                   `{ count, exact }` when `--just-count` is set.
+           - Table columns: `Received | From | Subject | Att | Id` (default).
 
         4. `get-mail <id> [--body <html|text|none>]`
            - Retrieves one message. `id` is positional and required.
@@ -187,6 +204,22 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
                           `none` (omit the Body field).
            - Fetches `/api/v2.0/me/messages/{id}` plus `.../attachments` metadata
              and merges them as `Attachments: AttachmentSummary[]` on the result.
+
+        4a. `get-thread <id> [--body <html|text|none>] [--order <asc|desc>]`
+           - Retrieves every message in the conversation (thread) that `id`
+             belongs to, regardless of folder. Uses
+             `GET /me/messages?$filter=ConversationId eq '<id>'`.
+           - `<id>` positional — either a message id, or `conv:<rawConversationId>`
+             to skip the initial resolve hop.
+           - `--body`     `html` / `text` (default) / `none`. Body handling
+                          mirrors `get-mail`: `none` omits it; `html`/`text`
+                          include the upstream Body + BodyPreview in
+                          `$select`. No HTML→text conversion is done.
+           - `--order`    `asc` (default, oldest-first) or `desc`. Passed
+                          through as `$orderby=ReceivedDateTime <order>`.
+           - JSON: `{ conversationId, count, messages: MessageSummary[] }`.
+           - Table columns: `Received | From | Subject | Id` (renders only
+                          the messages array).
 
         5. `download-attachments <id> --out <dir> [--overwrite] [--include-inline]`
            - Saves FileAttachment content bytes into `--out` (created with mode

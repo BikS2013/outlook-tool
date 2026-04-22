@@ -175,15 +175,19 @@ describe('loadConfig', () => {
     expect(Object.isFrozen(cfg)).toBe(true);
   });
 
-  it('rejects listMailTop outside 1..100', () => {
+  it('rejects listMailTop outside 1..1000', () => {
     process.env[ENV.HTTP_TIMEOUT_MS] = '5000';
     process.env[ENV.LOGIN_TIMEOUT_MS] = '60000';
     process.env[ENV.CHROME_CHANNEL] = 'chrome';
     expect(() => loadConfig({ listMailTop: 0 })).toThrowError(
       ConfigurationError,
     );
-    expect(() => loadConfig({ listMailTop: 101 })).toThrowError(
+    expect(() => loadConfig({ listMailTop: 1001 })).toThrowError(
       ConfigurationError,
     );
+    // Boundary: 1000 must be accepted.
+    expect(() => loadConfig({ listMailTop: 1000 })).not.toThrow();
+    // Boundary: 101 (old rejection) must now be accepted.
+    expect(() => loadConfig({ listMailTop: 101 })).not.toThrow();
   });
 });

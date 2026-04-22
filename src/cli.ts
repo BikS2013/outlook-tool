@@ -49,6 +49,7 @@ import * as authCheck from './commands/auth-check';
 import * as login from './commands/login';
 import * as listMail from './commands/list-mail';
 import * as getMail from './commands/get-mail';
+import * as getThread from './commands/get-thread';
 import * as downloadAttachments from './commands/download-attachments';
 import * as listCalendar from './commands/list-calendar';
 import * as getEvent from './commands/get-event';
@@ -238,6 +239,31 @@ const LIST_MAIL_COLUMNS: ColumnSpec<MessageSummary>[] = [
     // No maxWidth: IDs must never be truncated, otherwise copy-paste into
     // `get-mail`/`download-attachments` sends an ellipsis character instead
     // of the real bytes and the server returns ErrorInvalidIdMalformed.
+  },
+];
+
+const GET_THREAD_COLUMNS: ColumnSpec<MessageSummary>[] = [
+  {
+    header: 'Received',
+    extract: (r) => r.ReceivedDateTime ?? '',
+    maxWidth: 20,
+  },
+  {
+    header: 'From',
+    extract: (r) =>
+      r.From?.EmailAddress?.Name ||
+      r.From?.EmailAddress?.Address ||
+      '',
+    maxWidth: 28,
+  },
+  {
+    header: 'Subject',
+    extract: (r) => r.Subject ?? '',
+    maxWidth: 56,
+  },
+  {
+    header: 'Id',
+    extract: (r) => r.Id ?? '',
   },
 ];
 
@@ -589,7 +615,7 @@ export async function main(argv: string[]): Promise<number> {
   program
     .command('list-mail')
     .description('List recent messages from a well-known folder')
-    .option('-n, --top <N>', 'Number of messages (1..100)', parseIntArg)
+    .option('-n, --top <N>', 'Number of messages (1..1000, default 10)', parseIntArg)
     .option(
       '--folder <name>',
       'Folder name (Inbox|SentItems|Drafts|DeletedItems|Archive or path/alias)',
@@ -603,6 +629,25 @@ export async function main(argv: string[]): Promise<number> {
       'Anchor for a path/bare-name in --folder (default MsgFolderRoot)',
     )
     .option('--select <csv>', 'Comma-separated $select fields')
+    .option(
+      '--from <value>',
+      'Lower bound on ReceivedDateTime (inclusive). ' +
+        'ISO8601 "YYYY-MM-DDTHH:MM:SSZ" (UTC, e.g. 2026-04-01T00:00:00Z) ' +
+        'or "YYYY-MM-DD HH:MM:SS" (local time) ' +
+        'or keyword: "now" / "now + Nd" / "now - Nd".',
+    )
+    .option(
+      '--to <value>',
+      'Upper bound on ReceivedDateTime (exclusive). ' +
+        'ISO8601 "YYYY-MM-DDTHH:MM:SSZ" (UTC, e.g. 2026-05-01T00:00:00Z) ' +
+        'or "YYYY-MM-DD HH:MM:SS" (local time) ' +
+        'or keyword: "now" / "now + Nd" / "now - Nd".',
+    )
+    .option(
+      '--just-count',
+      'Return only the count of matching messages (server-side via $count=true). ' +
+        'Ignores --top and --select. Works with every folder flag and --from/--to.',
+    )
     .action(
       makeAction<
         {
@@ -611,15 +656,24 @@ export async function main(argv: string[]): Promise<number> {
           folderId?: string;
           folderParent?: string;
           select?: string;
+          from?: string;
+          to?: string;
+          justCount?: boolean;
         },
         []
       >(program, async (deps, g, cmdOpts) => {
         const result = await listMail.run(deps, cmdOpts);
-        emitResult(
-          result,
-          resolveOutputMode(g),
-          LIST_MAIL_COLUMNS as unknown as ColumnSpec<unknown>[],
-        );
+        const mode = resolveOutputMode(g);
+        // Discriminate: count mode returns a single object, list mode an array.
+        if (Array.isArray(result)) {
+          emitResult(
+            result,
+            mode,
+            LIST_MAIL_COLUMNS as unknown as ColumnSpec<unknown>[],
+          );
+        } else {
+          emitResult(result, mode);
+        }
       }),
     );
 
@@ -637,6 +691,45 @@ export async function main(argv: string[]): Promise<number> {
           emitResult(result, resolveOutputMode(g));
         },
       ),
+    );
+
+  // -------- get-thread <id> --------
+  program
+    .command('get-thread')
+    .argument(
+      '<id>',
+      'Message id (or "conv:<conversationId>" to skip the resolve hop)',
+    )
+    .description(
+      'Retrieve every message in a conversation (thread) regardless of folder',
+    )
+    .option(
+      '--body <mode>',
+      'Body inclusion: html|text|none (default text)',
+    )
+    .option(
+      '--order <asc|desc>',
+      'ReceivedDateTime order (default asc = oldest first)',
+    )
+    .action(
+      makeAction<
+        { body?: getThread.ThreadBodyMode; order?: getThread.ThreadOrder },
+        [string]
+      >(program, async (deps, g, cmdOpts, id) => {
+        const result = await getThread.run(deps, id, cmdOpts);
+        // Table mode renders only the `messages` array; JSON mode emits the
+        // full ThreadResult (conversationId + count + messages).
+        const mode = resolveOutputMode(g);
+        if (mode === 'table') {
+          emitResult(
+            result.messages,
+            mode,
+            GET_THREAD_COLUMNS as unknown as ColumnSpec<unknown>[],
+          );
+        } else {
+          emitResult(result, mode);
+        }
+      }),
     );
 
   // -------- download-attachments <id> --------
