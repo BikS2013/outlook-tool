@@ -17,6 +17,9 @@
 import * as path from 'node:path';
 import * as dotenv from 'dotenv';
 
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import type { StructuredToolInterface } from '@langchain/core/tools';
+
 import type { CliConfig } from '../config/config';
 import type { SessionFile } from '../session/schema';
 import type { OutlookClient } from '../http/outlook-client';
@@ -78,6 +81,12 @@ export interface AgentOptions extends AgentConfigFlags {
   noAutoReauth?: boolean;
   /** Inherited from the global `--quiet` flag. */
   quiet?: boolean;
+  /** Mapped from `--agent-memory-file` (see design §TUI.7). Flows through
+   *  to `loadAgentConfig` via the inherited `AgentConfigFlags` shape. */
+  agentMemoryFile?: string;
+  /** Mapped from `--agent-model-file` (see design §TUI.7). Flows through
+   *  to `loadAgentConfig` via the inherited `AgentConfigFlags` shape. */
+  agentModelFile?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +195,29 @@ export async function run(
 
     // 10. Dispatch.
     if (cfg.interactive) {
-      await runInteractive({ model, tools, systemPrompt, cfg, logger });
+      // Closures that rebuild the model and tool catalog for a different
+      // `cfg` — used by the TUI's `/model` slash command to swap providers
+      // mid-session. These mirror the model + tools construction done at
+      // startup (steps 7 + 8 above).
+      const rebuildModel = async (nextCfg: AgentConfig): Promise<BaseChatModel> => {
+        const factory = getProvider(nextCfg.provider);
+        return factory(nextCfg);
+      };
+      const rebuildTools = (nextCfg: AgentConfig): StructuredToolInterface[] => {
+        return buildToolCatalog(deps, nextCfg);
+      };
+      await runInteractive({
+        model,
+        tools,
+        systemPrompt,
+        cfg,
+        logger,
+        // `AgentOptions extends AgentConfigFlags`, so passing the whole
+        // options object is shape-compatible with `AgentConfigFlags`.
+        startupFlags: opts,
+        rebuildModel,
+        rebuildTools,
+      });
       return;
     }
     // Non-interactive path: prompt is guaranteed non-null here by the

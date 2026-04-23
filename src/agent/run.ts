@@ -12,7 +12,7 @@
 import { MemorySaver } from '@langchain/langgraph';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type { AgentConfig } from '../config/agent-config';
+import type { AgentConfig, AgentConfigFlags } from '../config/agent-config';
 import type { AgentLogger } from './logging';
 import { createAgentGraph } from './graph';
 
@@ -316,6 +316,45 @@ export async function runOneShot(args: {
 // ---------------------------------------------------------------------------
 
 export async function runInteractive(args: {
+  model: BaseChatModel;
+  tools: StructuredToolInterface[];
+  systemPrompt: string;
+  cfg: AgentConfig;
+  logger: AgentLogger;
+  stdin?: NodeJS.ReadableStream;
+  stdout?: NodeJS.WritableStream;
+  /** NEW — when provided (alongside `rebuildModel` + `rebuildTools`),
+   *  `runInteractive` dispatches to the TUI entry point in `./tui/index`.
+   *  When absent, it falls back to the legacy readline REPL so existing
+   *  test harnesses keep working unmodified. */
+  startupFlags?: AgentConfigFlags;
+  rebuildModel?: (cfg: AgentConfig) => Promise<BaseChatModel>;
+  rebuildTools?: (cfg: AgentConfig) => StructuredToolInterface[];
+}): Promise<void> {
+  if (args.startupFlags && args.rebuildModel && args.rebuildTools) {
+    // Lazy-load the TUI tree so test harnesses that never hit this path
+    // don't pull in the full raw-mode terminal stack (and its transitive
+    // system-prompt loader, which uses `require()` at load time).
+    const { runTui } = await import('./tui/index');
+    await runTui({
+      model: args.model,
+      tools: args.tools,
+      systemPrompt: args.systemPrompt,
+      cfg: args.cfg,
+      startupFlags: args.startupFlags,
+      logger: args.logger,
+      rebuildModel: args.rebuildModel,
+      rebuildTools: args.rebuildTools,
+    });
+    return;
+  }
+  // Fall back to the legacy readline REPL for callers that haven't migrated
+  // (used only by existing tests — production wiring in cli.ts→commands/agent.ts
+  // always passes the new fields).
+  await runInteractiveLegacy(args);
+}
+
+async function runInteractiveLegacy(args: {
   model: BaseChatModel;
   tools: StructuredToolInterface[];
   systemPrompt: string;

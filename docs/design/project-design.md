@@ -4380,3 +4380,763 @@ Additional ADRs specific to this design:
 
 Absolute output path: `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/project-design.md`
 
+---
+
+## Section §TUI — Agent Interactive TUI
+
+**Date added:** 2026-04-23
+**Source plan:** `docs/design/plan-004-agent-tui.md` (approved).
+**Source spec:** `prompts/004-agent-tui-spec.md` (sections 1–17).
+**Scope:** Technical design for the replacement of `runInteractive` in
+`src/agent/run.ts` with a raw-mode terminal UI driven by
+LangGraph's `graph.streamEvents({ version: "v2", ... })` stream. The
+one-shot mode (`runOneShot`) is untouched. The existing `AgentConfig`
+loader, session store, redaction pipeline, Chrome auto-reauth, and tool
+adapter surface are reused verbatim — this section introduces only the
+TUI-specific presentation / persistence layer.
+
+### §TUI.1 Architecture diagram
+
+Module boundary — the TUI hangs off a single entry point (`runTui`)
+which composes nine small modules. Every arrow is a direct import (no
+event bus, no registry).
+
+```
+ cli.ts ──▶ commands/agent.ts
+                       │
+                       ▼
+               loadAgentConfig  (src/config/agent-config.ts)
+                       │
+                       ▼
+                   runTui(cfg)          ◀── src/agent/tui/index.ts
+                   /     │      \
+                  ▼      ▼       ▼
+             banner  main-loop  unhandledRejection
+                        │
+      ┌─────────────────┼───────────────────┐
+      ▼                 ▼                   ▼
+  readInput         dispatch             runTurn
+(tui/input.ts)  (tui/commands/*.ts)    (tui/turn.ts)
+      │               │      │              │
+      │               │      │              ▼
+      │               │      │     graph.streamEvents(v2)
+      │               │      │              │
+      ▼               ▼      ▼              ▼
+   keymap     memoryStore  modelStore   spinner + printHeaderOnce
+   (ansi.ts)  (memory-     (model-      (spinner.ts, ansi.ts)
+              store.ts)    store.ts)
+                    │
+                    ▼
+              clipboard      printSystem
+            (clipboard.ts)   (tui/io.ts)
+```
+
+Invariants:
+1. **Only `src/agent/tui/commands/model.ts` reads `process.env`
+   directly** (via `resolveParam`). All other modules get values from
+   the `TuiContext` or from function arguments.
+2. **Only `src/agent/tui/index.ts` calls `loadAgentConfig`** — either
+   at startup or when `/model` rebuilds the graph.
+3. **Only `src/agent/tui/turn.ts` touches `graph.streamEvents`.** All
+   other modules manipulate `TuiContext` but never the runnable.
+4. `runOneShot` from `src/agent/run.ts` is NEVER called from `runTui`.
+   `runInteractive` becomes a thin adapter: `return runTui(cfg)`.
+
+### §TUI.2 Module catalogue
+
+New files introduced by phases A–I (paths relative to the repo root):
+
+| Path | Exports | Purpose | Est. lines |
+|---|---|---|---|
+| `src/agent/tui/ansi.ts` | `RESET, BOLD, DIM, GREEN, CYAN, YELLOW, RED, CLEAR_LINE, SAVE_CURSOR, RESTORE_CURSOR` constants; `stripAnsi(s)` helper | Shared VT100 primitives so input.ts and spinner.ts avoid circular deps | 40 |
+| `src/agent/tui/io.ts` | `printSystem(line: string, kind?: "info"\|"error"\|"warn"): void`; `printAgentHeader(): void` (idempotent per turn); `resetAgentHeader(): void` | Thin wrappers around `process.stdout.write` honoring `--quiet` and ansi colors | 60 |
+| `src/agent/tui/spinner.ts` | `createSpinner(label: string): SpinnerHandle` | Single-active-instance braille spinner, 80 ms tick | 80 |
+| `src/agent/tui/input.ts` | `readInput(prompt, continuationPrompt, inputHistory): Promise<string>`; pure helpers `replaceInput`, `insertNewline`, `handleBackspace`, `redrawCurrentLine` (exported for unit tests) | Raw-mode multiline reader with full spec §5 keymap | 480 |
+| `src/agent/tui/clipboard.ts` | `copyToClipboard(text: string): Promise<ClipboardResult>`; internal `detectTools(): string[]` (test seam) | Cross-platform dispatch (`pbcopy` / `xclip` / `xsel` / `clip.exe`) | 90 |
+| `src/agent/tui/memory-store.ts` | `createMemoryStore(filePath: string): MemoryStore` | Atomic-write JSON user-memory CRUD, mode 0600 | 120 |
+| `src/agent/tui/model-store.ts` | `createModelStore(filePath: string): ModelStore`; `SavedModel` type | Atomic-write JSON saved-model CRUD, mode 0600 | 130 |
+| `src/agent/tui/turn.ts` | `runTurn(ctx: TuiContext, userText: string, handlers?: TurnEventHandlers): Promise<TurnResult>` | Wires `AbortController`, spinner, header-once, ESC handler, and the three v2 events | 200 |
+| `src/agent/tui/commands/index.ts` | `dispatch(input: string, ctx: TuiContext): Promise<DispatchResult>`; `parseSlashCommand(input: string): ParsedSlash` | Slash-command router; the single import target from `runTui`'s main loop | 180 |
+| `src/agent/tui/commands/help.ts` | `handleHelp(ctx): Promise<DispatchResult>` | `/help` payload | 60 |
+| `src/agent/tui/commands/history.ts` | `handleHistory(ctx): Promise<DispatchResult>` | `/history` printer (200-char truncation) | 50 |
+| `src/agent/tui/commands/state.ts` | `handleState(ctx): Promise<DispatchResult>` | `/state` via `graph.getState({configurable:{thread_id}})` | 50 |
+| `src/agent/tui/commands/memory.ts` | `handleMemory(args, ctx): Promise<DispatchResult>` | `/memory`, `/memory add`, `/memory remove N`, `/memory clear` | 100 |
+| `src/agent/tui/commands/new-thread.ts` | `handleNewThread(ctx): Promise<DispatchResult>` | `/new` + `/reset` — new threadId, clears messages + inputHistory | 45 |
+| `src/agent/tui/commands/last.ts` | `handleLast(ctx): Promise<DispatchResult>` | `/last`, `/raw` — print `lastRawResponse` verbatim | 30 |
+| `src/agent/tui/commands/copy.ts` | `handleCopy(ctx, all: boolean): Promise<DispatchResult>` | `/copy`, `/copy-all` — dispatches to `clipboard.ts` | 70 |
+| `src/agent/tui/commands/model.ts` | `handleModel(args, ctx): Promise<DispatchResult>`; `resolveParam(flag, envVar, flags): string \| null` | `/model`, `/model <provider> --flag v`, `/model reset` | 240 |
+| `src/agent/tui/commands/monitor.ts` | `handleMonitor(ctx): Promise<DispatchResult>` | Stubbed — prints deferred message | 20 |
+| `src/agent/tui/commands/quit.ts` | `handleQuit(ctx): Promise<DispatchResult>` | `/quit`, `/exit` — logger.close + spinner.stop + rawMode(false) + exit 0 | 35 |
+| `src/agent/tui/index.ts` | `runTui(cfg: AgentConfig): Promise<void>`; internal `printBanner(ctx)` | Composition root: load saved model+memory, build graph, banner, main loop, unhandledRejection hook | 280 |
+
+All files are TypeScript, ESM-style imports, `import type` used for
+type-only references (to keep the CJS-compatible build clean per §14).
+Total new code: ~2300 LOC excluding tests.
+
+### §TUI.3 Public TypeScript interfaces
+
+All signatures below are declared in the noted home module and imported
+elsewhere. No implementation is included — this is the locked contract.
+
+```ts
+// src/agent/tui/types.ts  (new file; co-locates shared types to avoid
+// cyclic imports between index.ts, turn.ts, and commands/*.ts)
+
+import type { AgentConfig, ProviderName } from "../../config/agent-config";
+import type { AgentLogger } from "../logging";
+
+export interface LocalMessage {
+  readonly role: "user" | "agent";
+  readonly text: string;
+  readonly timestamp: number; // Date.now()
+}
+
+export interface SpinnerHandle {
+  setLabel(s: string): void;
+  start(): void;
+  stop(): void;
+  isActive(): boolean;
+}
+
+export interface MemoryStore {
+  getEntries(): readonly string[];
+  add(entry: string): void;
+  remove(oneIndexed: number): void;   // throws RangeError if out of range
+  clear(): void;
+  readonly filePath: string;
+}
+
+export interface SavedModel {
+  readonly version: 1;
+  readonly provider: ProviderName;
+  readonly model: string;
+  readonly temperature?: number;
+  readonly maxSteps?: number;
+  readonly systemPromptFile?: string;
+  /** User-entered `--flag` values keyed by canonical env-var name.
+   *  Resolved-from-env defaults are NEVER written here. */
+  readonly providerSpecific: Readonly<Record<string, string>>;
+}
+
+export interface ModelStore {
+  load(): SavedModel | null;         // null on missing OR corrupt
+  save(m: SavedModel): void;         // atomic write, mode 0600
+  clear(): void;                     // rm (idempotent)
+  readonly filePath: string;
+}
+
+export interface ClipboardResult {
+  readonly ok: boolean;
+  readonly tool?: string;            // "pbcopy" | "xclip" | "xsel" | "clip.exe"
+  readonly reason?: string;          // populated when !ok
+}
+
+export type ReadInputResult = string; // rejected with Error("SIGINT") or Error("EOF")
+
+export interface TurnEventHandlers {
+  onChatModelStream(chunk: string): void;
+  onToolStart(toolName: string): void;
+  onToolEnd(toolName: string): void;
+}
+
+export interface TurnResult {
+  readonly aborted: boolean;
+  readonly errored: boolean;
+  readonly errorMessage?: string;    // redacted
+  readonly agentText: string;        // accumulated stream (may be "")
+}
+
+export interface DispatchResult {
+  readonly handled: boolean;         // true = don't treat as agent turn
+  readonly exit?: boolean;           // quit after this dispatch
+  readonly resetThread?: boolean;    // new thread id + wipe messages/history
+  readonly rebuildGraph?: boolean;   // recreate runnable from newModel/config
+  readonly newModel?: SavedModel;    // passed up by /model success path
+}
+
+export interface ParsedSlash {
+  readonly command: string;          // lowercase, no leading slash
+  readonly args: readonly string[];  // tokens after command, quotes stripped
+}
+
+/**
+ * The runtime state bag threaded through the TUI main loop. Every field
+ * is either readonly (swap-via-closure is not allowed) or explicitly
+ * marked mutable (`messages`, `inputHistory`, `lastRawResponse`,
+ * `threadId`, `isRunning`, `abortController`, `graph`, `cfg`).
+ */
+export interface TuiContext {
+  cfg: AgentConfig;                          // swapped by /model
+  graph: import("../graph").AgentGraph;      // swapped by /model and /new
+  threadId: string;                          // swapped by /new, /reset, /model
+  messages: LocalMessage[];                  // cleared by /new
+  inputHistory: string[];                    // cleared by /new
+  lastRawResponse: string;                   // updated at end of each turn
+  readonly logger: AgentLogger;
+  readonly memoryStore: MemoryStore;
+  readonly modelStore: ModelStore;
+  isRunning: boolean;                        // true while a turn streams
+  abortController: AbortController | null;   // non-null only during a turn
+  readonly printSystem: (line: string, kind?: "info"|"error"|"warn") => void;
+}
+```
+
+Notes:
+- `AgentGraph` is the return type of `createAgent(cfg)` in
+  `src/agent/graph.ts`. It is expected to expose `.streamEvents` and
+  `.getState` per plan §3 R-1.
+- `TuiContext.printSystem` is injected rather than imported so that
+  unit tests of command handlers can supply a spy.
+- `SavedModel.providerSpecific` values are **plaintext**. Protection
+  is filesystem-level (mode 0600 under 0700 parent dir). The
+  user-entered-only rule is enforced by `commands/model.ts`, not by
+  the store.
+
+### §TUI.4 Streaming event-loop contract
+
+The turn handler consumes exactly three event types from
+`graph.streamEvents({ version: "v2", ... })`. All other events are
+ignored. The table below is a one-to-one refinement of spec §4.
+
+| `event.event` | Payload used | Action | Spinner delta | Order invariant |
+|---|---|---|---|---|
+| `on_chat_model_stream` | `event.data.chunk.content: string` (non-empty) | `spinner.stop()` → `printAgentHeader()` (once) → `stdout.write(chunk)` → `agentText += chunk` | stops for the rest of the turn after first non-empty chunk | **Header MUST be printed before any chunk byte reaches stdout.** If the first event was a `on_tool_start`, `printAgentHeader()` has already been called with the "no-trailing-space" branch; the first stream chunk adds a newline first. |
+| `on_tool_start` | `event.name: string` | `spinner.stop()` → `printAgentHeader()` (once, no trailing space) → `stdout.write("\n  ↳ calling " + event.name + "(...)")` | stopped | **Tool-start indicator MUST NOT appear before the Agent header line.** |
+| `on_tool_end` | ignored | `stdout.write(" ✓")` → `spinner.setLabel("Processing tool result...")` → `spinner.start()` | restarts immediately | **✓ glyph MUST land on the same visual line as `↳ calling foo(...)`** (no intervening newline). |
+
+Abort path: `AbortController.signal` is forwarded to
+`graph.streamEvents`. On abort, the async iterator throws an
+`AbortError`; `runTurn` swallows it and sets
+`result.aborted = true`. Post-stream rendering:
+
+| State | Final stdout write | Spinner | History push |
+|---|---|---|---|
+| aborted | `\n[interrupted]` in dim yellow | stopped | not pushed |
+| errored (non-abort) | `\n[error] <redacted message>` in red | stopped | not pushed |
+| success, `agentText !== ""` | `\n` (single newline) | stopped | user + agent pushed |
+| success, `agentText === ""` | `\n[no content]` in dim | stopped | user pushed; agent NOT pushed |
+
+`ctx.lastRawResponse` is set to `agentText` in success AND error paths
+(so `/last` can inspect a partial response). It is **not** cleared on
+abort — a partial mid-stream response is intentionally preserved.
+
+### §TUI.5 Keyboard handling state machine
+
+Redrawn from spec §5 with added terminal-compat notes. Groups reflect
+the dispatcher shape inside `input.ts#processKey(bytes)`.
+
+**Category A — control characters (single byte)**
+
+| Byte | Name | Action | Notes |
+|---|---|---|---|
+| `0x03` | Ctrl+C | During input: `reject(new Error("SIGINT"))` | Also handled in exec loop as abort |
+| `0x04` | Ctrl+D | Empty input: `reject(new Error("EOF"))`; non-empty: ignore | — |
+| `0x0A` | Ctrl+J (LF) | Insert newline (universal Shift+Enter) | Preferred portable newline |
+| `0x0D` | Enter (CR) | Submit `lines.join("\n")` | — |
+| `0x7F`, `0x08` | Backspace | Delete prev char; at col 0 merge with prev line | iTerm2 sends `0x7F`; some linuxes `0x08` |
+| `0x01` | Ctrl+A | Cursor → col 0 | — |
+| `0x05` | Ctrl+E | Cursor → EOL | — |
+| `0x0B` | Ctrl+K | Delete to EOL | — |
+| `0x15` | Ctrl+U | Delete to SOL | — |
+| `0x17` | Ctrl+W | Delete word back | — |
+| `0x1B` | ESC (lone) | Start escape-buffer accumulation | Buffer discarded at > 10 bytes |
+
+**Category B — arrow keys & cursor motion**
+
+| Bytes | Action | Notes |
+|---|---|---|
+| `\x1b[A` / `[B` | ↑/↓ within current input; on top/bottom edge → history nav | — |
+| `\x1b[C` / `[D` | → / ← | — |
+| `\x1b[H`, `\x1b[F`, `\x1bOH`, `\x1bOF`, `\x1b[1~`, `\x1b[4~` | Home / End | Multiple forms covered for Kitty, Ghostty, xterm, VT220 |
+| `\x1b[1;9D` / `[1;9C` | Cmd+← / Cmd+→ (iTerm2) | Line motion |
+| `\x1b[1;2H` / `[1;2F` | Some Cmd+arrow variants | Line motion |
+
+**Category C — word motion**
+
+| Bytes | Action | Notes |
+|---|---|---|
+| `\x1b[1;3D` / `[1;3C` | Option+← / Option+→ | macOS default |
+| `\x1b[1;5D` / `[1;5C` | Ctrl+← / Ctrl+→ | Linux terminals |
+| `\x1bb` / `\x1bf` | Alt+b / Alt+f (legacy) | Readline compatibility |
+
+**Category D — deletion (compound)**
+
+| Bytes | Action | Notes |
+|---|---|---|
+| `\x1b[3~` | Delete key | — |
+| `\x1b[3;9~` | Cmd+Backspace | Delete to SOL |
+| `\x1b` + `0x7F` | Alt+Backspace | Delete word back |
+
+**Category E — submit-newline disambiguation**
+
+| Bytes | Action | Notes |
+|---|---|---|
+| `\x1b[13;2u` | Shift+Enter (Kitty) | Insert newline |
+| `\x1bOM` | Shift+Enter (some terms) | Insert newline |
+
+**Category F — escape buffer management**
+
+| Condition | Action |
+|---|---|
+| buffer length > 10 bytes | Discard buffer; return to normal input mode |
+| buffer starts with `\x1b[` and next byte is `~` or alpha | Terminator reached → dispatch |
+| timeout 50 ms after lone `\x1b` | Treat as plain ESC (reserved: no current action during input) |
+
+**Terminal compat notes**
+- Kitty emits `\x1b[13;2u` for Shift+Enter (the only reason we accept
+  that sequence).
+- iTerm2 emits `\x1b[1;9D` / `[1;9C` for Cmd+arrow.
+- Ghostty matches Kitty's keymap.
+- Windows Terminal emits standard VT sequences; `cmd.exe` (pre-Terminal)
+  is unsupported per plan §6.
+
+### §TUI.6 File formats
+
+#### §TUI.6.1 `agent-memory.json`
+
+Default path: `$HOME/.outlook-cli/agent-memory.json` (mode 0600 inside
+the existing 0700 profile dir). Override: `OUTLOOK_AGENT_MEMORY_FILE`
+env or `--agent-memory-file` flag.
+
+```json
+{
+  "version": 1,
+  "entries": [
+    "prefer concise summaries",
+    "always include the message id when referencing emails"
+  ]
+}
+```
+
+Rules:
+- Missing file → `getEntries()` returns `[]`. Not a configuration error.
+- Corrupt JSON (parse error, missing `version`, `entries` not a
+  string[]) → log warn via `ctx.logger.warn("corrupt memory file at
+  <path>, treating as empty")` and return `[]`. **No write-back** —
+  the corrupt file is left for the user to inspect.
+- Write path: write temp file in same dir → `fsync` → atomic rename
+  over the target. Parent directory auto-created with mode 0700 if
+  missing (mirrors `src/session/store.ts`).
+- Each `add(entry)` reads the current file, appends, writes atomically.
+  Concurrent writers from two TUI processes → last-writer-wins (no
+  advisory lock; cost/benefit deemed too low — see plan Phase C risks).
+
+#### §TUI.6.2 `agent-model.json`
+
+Default path: `$HOME/.outlook-cli/agent-model.json` (mode 0600).
+Override: `OUTLOOK_AGENT_MODEL_FILE` env or `--agent-model-file` flag.
+
+```json
+{
+  "version": 1,
+  "provider": "azure-openai",
+  "model": "gpt-4o",
+  "temperature": 0.0,
+  "maxSteps": 10,
+  "providerSpecific": {
+    "OUTLOOK_AGENT_AZURE_OPENAI_API_KEY": "sk-...",
+    "OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT": "https://contoso.openai.azure.com"
+  }
+}
+```
+
+Rules:
+- **`providerSpecific` contains ONLY user-entered flag values.** If
+  the user typed `/model azure-openai --endpoint https://...`, that
+  endpoint lands in `providerSpecific`. If the endpoint came from
+  `process.env.OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT`, it does NOT.
+  This is enforced by `commands/model.ts`, which passes the parsed
+  `--flag` map to `saveModel` — not the resolved `AgentConfig`.
+- Missing file → `load()` returns `null`. Not an error.
+- Corrupt JSON / schema-invalid → log warn, `load()` returns `null`.
+- Load precedence at startup: saved model (if present) wins over
+  env config. `/model reset` deletes the file and next
+  `loadAgentConfig()` call re-reads env.
+- Mode 0600, atomic write (same recipe as §TUI.6.1).
+
+### §TUI.7 Config surface additions
+
+Two — and only two — new rows are added to the `AgentConfig`
+canonical table:
+
+| Setting | Flag | Env var | Default |
+|---|---|---|---|
+| `memoryFile` | `--agent-memory-file <path>` | `OUTLOOK_AGENT_MEMORY_FILE` | `path.join(os.homedir(), ".outlook-cli", "agent-memory.json")` |
+| `modelFile` | `--agent-model-file <path>` | `OUTLOOK_AGENT_MODEL_FILE` | `path.join(os.homedir(), ".outlook-cli", "agent-model.json")` |
+
+Precedence: **CLI flag > env var > default** (standard TUI plumbing
+tier — these two are "operational plumbing" in the same spirit as the
+existing three-setting exception `httpTimeoutMs`, `loginTimeoutMs`,
+`chromeChannel`).
+
+**Phase J — CLAUDE.md exception update.** Insert the following text
+verbatim under the `### Exception — defaults allowed for three
+runtime-plumbing config settings` heading (change the heading to
+`### Exception — defaults allowed for five runtime-plumbing config
+settings`):
+
+> On 2026-04-23 the user additionally approved defaults for two more
+> settings introduced by the Agent Interactive TUI (plan-004):
+>
+> - `memoryFile` — default
+>   `$HOME/.outlook-cli/agent-memory.json`. Env:
+>   `OUTLOOK_AGENT_MEMORY_FILE`. Flag: `--agent-memory-file`.
+> - `modelFile` — default
+>   `$HOME/.outlook-cli/agent-model.json`. Env:
+>   `OUTLOOK_AGENT_MODEL_FILE`. Flag: `--agent-model-file`.
+>
+> Rationale: identical to the original three — these are local on-disk
+> paths, not secrets or environment-distinguishing identities; forcing
+> the user to set them on every invocation provides no safety benefit
+> while breaking the TUI's "just works" contract.
+>
+> Implementation lands in `src/config/agent-config.ts` alongside the
+> existing `resolveOptionalString` helpers; the `AgentConfig` type
+> gains `memoryFile: string` and `modelFile: string` (both resolved to
+> absolute paths at load time).
+
+**Signature change to `loadAgentConfig` (Phase A).** To support
+`/model <provider> --flag v` without re-parsing env, `loadAgentConfig`
+gains an optional `overrides` parameter:
+
+```ts
+export interface AgentConfigOverrides {
+  /** Explicit values that take precedence over CLI flags, env, and
+   *  defaults. Typed as AgentConfigFlags so the same validators fire. */
+  readonly overrides?: Partial<AgentConfigFlags>;
+  /** Provider-specific env overrides — merged into process.env for the
+   *  duration of this call only. Used by /model to pass typed --flag
+   *  values into Unit 3 provider factories. */
+  readonly providerEnvOverrides?: Readonly<Record<string, string>>;
+}
+
+export function loadAgentConfig(
+  flags: AgentConfigFlags,
+  opts?: AgentConfigOverrides,
+): AgentConfig;
+```
+
+The second parameter is **purely additive** — existing callers continue
+to work unchanged. `providerEnvOverrides` are merged into the
+`providerEnv` snapshot returned by `buildProviderEnv` without mutating
+`process.env`.
+
+### §TUI.8 Slash-command dispatcher
+
+One-paragraph-per-command spec. Every command resolves to a
+`DispatchResult`. `handled: false` means "not a slash command —
+treat as an agent turn".
+
+- **`/help`** (no aliases). Syntax: `/help`. Prints banner excerpt
+  + keymap + command table via `printSystem` in dim style. No
+  side effects on `TuiContext`. Error conditions: none.
+
+- **`/history`** (no aliases). Syntax: `/history`. Prints
+  `ctx.messages` truncated to 200 chars per line. Side effects:
+  none. Errors: none.
+
+- **`/state`** (no aliases). Syntax: `/state`. Calls
+  `ctx.graph.getState({ configurable: { thread_id: ctx.threadId } })`
+  and prints `threadId`, message count, and the domain state field
+  list. Side effects: none. Errors: upstream `getState` failure →
+  `printSystem("[error] failed to read state: <redacted>", "error")`;
+  loop continues.
+
+- **`/memory`** (no aliases). Syntax: `/memory`, `/memory add <text>`,
+  `/memory remove <N>`, `/memory clear`. Mutates
+  `ctx.memoryStore` only (NOT `TuiContext` directly — next turn's
+  system prompt rebuild picks up the new entries). Errors:
+  `/memory remove 0` or out-of-range → user-visible error;
+  `/memory add ""` → user-visible error.
+
+- **`/new`** alias **`/reset`**. Syntax: `/new` or `/reset`. Sets
+  `ctx.threadId = generateId()`, `ctx.messages = []`,
+  `ctx.inputHistory = []`, `ctx.lastRawResponse = ""`. Returns
+  `{ handled: true, resetThread: true }`. Rebuild is NOT required
+  (LangGraph's `thread_id` is consulted per-call). Errors: rejected
+  with user-visible message if `ctx.isRunning === true`.
+
+- **`/last`** alias **`/raw`**. Syntax: `/last`. Prints
+  `ctx.lastRawResponse` verbatim (no ANSI stripping). Side effects:
+  none. Errors: if empty → `printSystem("[system] no previous
+  response")`.
+
+- **`/copy`**, **`/copy-all`**. Syntax: `/copy`, `/copy-all`.
+  Dispatches `ctx.lastRawResponse` (or the formatted full
+  conversation) to `clipboard.ts`. Side effects: none on
+  `TuiContext`. Errors: `ClipboardResult.ok === false` →
+  `printSystem("clipboard not available on this platform")`.
+
+- **`/model`**. See §TUI.9.
+
+- **`/monitor`** (stub). Syntax: `/monitor`. Prints via
+  `ctx.logger.info("monitoring disabled (built-in monitoring not
+  yet available)")`. Side effects: none. Errors: none.
+
+- **`/quit`** alias **`/exit`**. Syntax: `/quit`. Executes cleanup
+  in this exact order before `process.exit(0)`:
+  1. If `ctx.isRunning`, `ctx.abortController?.abort()` and await
+     up to 500 ms for the turn to settle.
+  2. `spinner.stop()` (belt-and-braces — runTurn already does this).
+  3. `process.stdin.setRawMode(false)`; `process.stdin.pause()`.
+  4. `await ctx.logger.close()`.
+  5. `process.exit(0)`.
+  Returns `{ handled: true, exit: true }` so the main loop does not
+  attempt a turn after dispatch.
+
+### §TUI.9 `/model` command grammar
+
+Tokenizer regex: `/(?:[^\s"]+|"[^"]*")/g`. Quoted tokens have their
+outer quotes stripped; inner double-quotes are not escaped (the
+tokenizer uses plain doublequote pairs — no shell-style escapes).
+
+Grammar (EBNF):
+
+```
+modelCommand ::= "/model" [ provider { flag value } ]
+provider     ::= "openai" | "anthropic" | "google"
+              | "azure-openai" | "azure-anthropic" | "azure-deepseek"
+              | "reset"
+flag         ::= "--" identifier
+value        ::= bareToken | quotedToken
+```
+
+Behaviors:
+1. `/model` alone — prints the current `ctx.cfg` as a table; API
+   keys masked via `maskSecret(s)` = first-4 + "…" + last-4. Side
+   effects: none.
+2. `/model reset` — `ctx.modelStore.clear()`; call
+   `loadAgentConfig(originalFlags)` (the flags captured at
+   `runTui` entry); rebuild graph; reset thread. Side effects:
+   `cfg`, `graph`, `threadId`, `messages`, `inputHistory`,
+   `lastRawResponse` all updated.
+3. `/model <provider> [--flag value]*` — full switch.
+
+The parser enforces:
+- First non-provider token MUST be a `--flag`.
+- Every `--flag` MUST be followed by a value (no boolean flags in
+  `/model`). Unpaired `--flag` → user-visible error
+  `"missing value for --<flag>"`.
+- `<provider>` MUST be a `ProviderName`. Unknown provider →
+  user-visible error listing valid providers.
+
+`resolveParam(flag, envVar, parsedFlags): string | null` precedence:
+
+```ts
+function resolveParam(
+  flag: string,                                  // e.g. "--api-key"
+  envVar: string,                                // e.g. "OUTLOOK_AGENT_OPENAI_API_KEY"
+  parsedFlags: Map<string, string>,              // tokens from the /model line
+): string | null {
+  if (parsedFlags.has(flag)) return parsedFlags.get(flag)!;
+  const envVal = process.env[envVar];
+  if (typeof envVal === "string" && envVal !== "") return envVal;
+  return null;
+}
+```
+
+If `resolveParam` returns `null` for a parameter the provider factory
+requires, `commands/model.ts` emits:
+
+```
+[error] Missing --<flag> and <ENV_VAR>
+```
+
+...via `printSystem("error", ...)`, and aborts the command (returns
+`{ handled: true }` WITHOUT `rebuildGraph`). The current
+`ctx.cfg` and `ctx.graph` are untouched.
+
+On success:
+1. Build parsed flags map.
+2. Build `providerEnvOverrides` = `{ <envVar>: value }` for each
+   `resolveParam` that came from `parsedFlags` (NOT from env).
+3. Call `loadAgentConfig(flagsAtStartup, { overrides: { provider,
+   model, temperature, maxSteps }, providerEnvOverrides })`. This is
+   the single enforcement point for the three-setting defaults rule
+   and the DeepSeek model denylist (both already baked into
+   `loadAgentConfig`).
+4. Build new `SavedModel` — `providerSpecific` = `providerEnvOverrides`
+   (user-entered only).
+5. `ctx.modelStore.save(newModel)`.
+6. Rebuild graph via `createAgent(newCfg)`; replace `ctx.graph`,
+   `ctx.cfg`.
+7. Reset thread (`resetThread: true` propagated via
+   `DispatchResult`).
+8. Print confirmation: `[system] switched to <provider>/<model>`.
+
+**Guard against mid-turn `/model`:** if `ctx.isRunning === true`,
+reject with `"cannot switch model while a turn is in flight"` and
+return `{ handled: true }`.
+
+### §TUI.10 Error handling strategy
+
+| Error class | Where raised | Runtime behavior | Loop continues? |
+|---|---|---|---|
+| `ConfigurationError` | `runTui` startup (before main loop) | Print `[error] config: <message>` + hint `"set OUTLOOK_AGENT_<NAME> or pass --env-file <path>"`; `process.exit(3)` | no |
+| `ConfigurationError` | Inside `/model` handler | `printSystem("[error] <message>")`; revert to previous cfg/graph; return to prompt | yes |
+| `AuthError` (from turn) | `runTurn` exec | `printSystem("[auth] <code> — <message>")`; if `--no-auto-reauth`, suggest `login --force` | yes |
+| `UpstreamError` (from turn) | `runTurn` exec | `printSystem("[upstream] <code> — <message>")` | yes |
+| `IoError` (from turn) | `runTurn` exec (download_attachments only) | `printSystem("[io] <message>")` | yes |
+| `UsageError` (from /model or /memory) | command handler | `printSystem("[error] <message>")` | yes |
+| `AbortError` | ESC / Ctrl+C during stream | `\n[interrupted]` in dim yellow | yes |
+| unknown `Error` | `runTurn` catch | `printSystem("[error] " + redactString(err.message))` | yes |
+| unknown `Error` | top-level `main().catch` | `[fatal] <redacted>`; `process.exit(1)` | — |
+
+**`unhandledRejection` handler** (installed by `runTui` before main
+loop enters):
+
+```ts
+process.on("unhandledRejection", (reason: unknown) => {
+  const msg = typeof reason === "string" ? reason : (reason as any)?.message ?? "";
+  const recoverable =
+    msg.includes("Error reading from the stream") ||
+    msg.includes("GoogleGenerativeAI");
+  if (recoverable) {
+    ctx.logger.debug("suppressed provider stream error: " + redactString(msg));
+    return;
+  }
+  // Rethrow — let main().catch + process.exit(1) take over.
+  throw reason;
+});
+```
+
+Only these two substring predicates are whitelisted. Adding more
+requires a design-doc amendment.
+
+### §TUI.11 Test seams
+
+Every pure function below is unit-testable without spawning a child
+process or a PTY. Unit tests live under `test_scripts/tui-*.test.ts`.
+
+| Seam | Home module | Test file | Coverage target |
+|---|---|---|---|
+| `replaceInput(lines, newLines, cursor): { lines, cursor }` | `tui/input.ts` | `tui-input-helpers.test.ts` | Cursor adjusted to min(current, new last-line length) |
+| `insertNewline(lines, cursor): { lines, cursor }` | `tui/input.ts` | `tui-input-helpers.test.ts` | Splits line at cursor; new cursor = { row+1, col:0 } |
+| `handleBackspace(lines, cursor): { lines, cursor }` | `tui/input.ts` | `tui-input-helpers.test.ts` | At col 0 merges with prev line; cursor goes to prev line's old EOL |
+| `redrawCurrentLine(line, prompt, cursorCol): string` | `tui/input.ts` | `tui-input-helpers.test.ts` | Emits `\r\x1b[2K` + prompt + line + cursor-positioning CSI |
+| Spinner frame rotation | `tui/spinner.ts` | `tui-spinner.test.ts` | Advances through 10 frames with fake timer |
+| `parseSlashCommand(input): ParsedSlash` | `tui/commands/index.ts` | `tui-slash-parser.test.ts` | Quoted tokens handled; leading `/` stripped; lowercase command |
+| `MemoryStore` CRUD round-trip | `tui/memory-store.ts` | `tui-memory-store.test.ts` | missing file → []; add persists; remove 1-indexed; clear wipes; corrupt file → [] + warn |
+| `ModelStore` CRUD round-trip | `tui/model-store.ts` | `tui-model-store.test.ts` | save→load equality; clear removes file; `/model reset` semantics |
+| `clipboardDispatch(tools, text, spawn): Promise<ClipboardResult>` | `tui/clipboard.ts` | `tui-clipboard.test.ts` | Injected `spawn` stub; iterates tool list; first non-ENOENT wins; all missing → `{ ok: false, reason: "clipboard not available on this platform" }` |
+| `resolveParam(flag, envVar, parsedFlags)` | `tui/commands/model.ts` | `tui-model-resolve.test.ts` | Precedence flag > env > null |
+
+Each test uses a temp directory (via `fs.mkdtempSync`) for the two
+JSON files. No real clipboard binary is invoked.
+
+### §TUI.12 Acceptance criteria (rolled-up)
+
+From plan §6, verbatim:
+
+1. `npm run build` clean — no new TypeScript errors introduced.
+2. `npm test` green — new unit tests:
+   - `test_scripts/tui-memory-store.test.ts` (round-trip + missing-file = [] + corrupt-file = [] + atomic-write-mode-0600).
+   - `test_scripts/tui-model-store.test.ts` (same shape).
+   - `test_scripts/tui-input-helpers.test.ts` (`replaceInput`, `insertNewline`, `handleBackspace`, `redrawCurrentLine` pure-function seams).
+   - `test_scripts/tui-clipboard.test.ts` (tool-absent detection with PATH override).
+3. Manual smoke (macOS iTerm2 + Ubuntu Terminal + Windows Terminal):
+   - Start TUI: `npx ts-node src/cli.ts agent --interactive --provider azure-openai --model gpt-4o`.
+   - Banner lines 1/2/4/5/6 render with correct colors.
+   - Type `list my 3 most recent unread emails` → Enter. Spinner animates, then first token triggers `Agent` header, `↳ calling list_mail(...)` appears, token stream resumes with label `Processing tool result...`, trailing newline.
+   - Press ESC during the stream → `[interrupted]` in yellow/dim, prompt returns.
+   - `/memory add prefer concise summaries` then `/memory` shows the entry. Next turn's response reflects it.
+   - `/model` shows current provider with masked key. `/model openai --api-key sk-test123` (fake) rebuilds graph; `/model reset` reverts.
+   - `/copy` after a response copies text. With clipboard unavailable, `"clipboard not available on this platform"` appears.
+   - `/quit` closes logger cleanly and exits 0.
+4. `Issues - Pending Items.md` contains the `/monitor stub → rich implementation` TODO as the top pending item.
+5. `CLAUDE.md`'s `<agent>` block lists every new slash command, env var, and CLI flag.
+
+### §TUI.13 Parallel implementation units (for Coders phase)
+
+The Coders phase launches one agent per "unit". Two units are
+parallel-safe iff they touch disjoint file sets. The matrix below is
+the contract.
+
+| Unit | Phases | Files touched (exclusive) | Depends on |
+|---|---|---|---|
+| **U1** | A | `src/config/agent-config.ts` (signature add only), `src/commands/agent.ts` (two new flags) | — |
+| **U2** | B | `src/agent/tui/clipboard.ts` (new) | — |
+| **U3** | C | `src/agent/tui/memory-store.ts` (new) | U1 (for default path contract) |
+| **U4** | D | `src/agent/tui/model-store.ts` (new) | U1 |
+| **U5** | E | `src/agent/tui/spinner.ts`, `src/agent/tui/ansi.ts`, `src/agent/tui/io.ts`, `src/agent/tui/types.ts` (all new) | — |
+| **U6** | F | `src/agent/tui/input.ts` (new) | U5 (only imports `ansi.ts`) |
+| **U7** | G | `src/agent/tui/commands/index.ts`, `src/agent/tui/commands/{help,history,state,memory,new-thread,last,copy,model,monitor,quit}.ts` (all new) | U1, U2, U3, U4, U5 |
+| **U8** | H | `src/agent/tui/turn.ts` (new) | U5, U6 |
+| **U9** | I | `src/agent/tui/index.ts` (new) | U1, U3, U4, U5, U6, U7, U8 |
+| **U10** | J | `src/agent/run.ts` (edit), `CLAUDE.md` (edit), `Issues - Pending Items.md` (edit), `.env.example` (add two rows) | U9 |
+
+**Parallel-safe groups** (files disjoint by construction):
+
+1. **Round 1 (fully parallel):** U1, U2, U5 can run in parallel — zero
+   shared files.
+2. **Round 2 (parallel after Round 1 completes):** U3, U4, U6, U8
+   can run in parallel — none share a file with each other; U3/U4
+   depend on U1; U6 depends on U5; U8 depends on U5+U6.
+3. **Round 3:** U7 runs alone (it imports from U1–U5 and must see
+   their committed exports).
+4. **Round 4:** U9 runs alone (integrates U1–U8).
+5. **Round 5:** U10 runs alone (wires into existing `run.ts` and
+   updates docs).
+
+File-exclusivity guarantee: no two units are allowed to edit the same
+file in the same round. U1 modifies `agent-config.ts` and
+`commands/agent.ts`; no other unit touches either file before U10 (which
+only edits `run.ts`, docs, and `.env.example`).
+
+### §TUI.14 Design decisions NOT covered by plan or user confirmations
+
+The following choices were made during technical design and are
+recorded here for audit. None of them contradict the plan or the three
+user-confirmed decisions; they fill gaps the plan left implicit.
+
+1. **`src/agent/tui/types.ts` is a new co-location file.** The plan
+   lists nine new files; the design adds `types.ts` and `ansi.ts` as
+   tenth and eleventh files so that shared types / ANSI constants
+   don't create cycles. Both are pure-leaf modules.
+2. **`io.ts` wraps `printSystem` / `printAgentHeader` / `resetAgentHeader`.**
+   The spec uses `printSystem` freely; the plan doesn't name a home
+   module. Co-locating with `ansi.ts` keeps the `--quiet` honor in
+   a single file.
+3. **`TuiContext` is injected as a plain object, not a class.** The
+   plan doesn't specify. A plain-object context keeps command
+   handlers trivially testable (spread-override any field in a test
+   double).
+4. **`loadAgentConfig` gains a second parameter, not a new function.**
+   The plan (phase G risks) says "call `loadAgentConfig({ overrides:
+   {...parsedFlags} })` with a new `overrides?` param". The exact
+   signature is locked in §TUI.7 above — two-arg form, second arg
+   optional, existing callers unaffected.
+5. **`/quit` 500 ms settle window.** The plan's decision #3 says
+   cleanup BEFORE `process.exit(0)`; it doesn't say whether to await
+   an in-flight turn. A bounded 500 ms await prevents hangs while
+   giving the graph a fair chance to honor the abort. A hard
+   `process.exit(0)` after the window is unconditional.
+6. **`TurnResult.agentText` always reflects whatever was streamed**,
+   including on error paths. The spec is silent. This choice lets
+   `/last` surface a partial response after a stream abort, which is
+   more useful than forcing it empty.
+7. **`resolveParam` signature is 3-arg, not 2-arg.** The spec's §9
+   shows two args, but a unit-testable seam needs the parsed-flags
+   map passed in (no hidden closure over `parsedFlags`). This is a
+   test-only accommodation — behavior is identical.
+8. **Header-once invariant is implemented with a
+   `resetAgentHeader()` + `printAgentHeader()` pair in `io.ts`**,
+   called by `runTurn` at turn-start and before every stream-event
+   side effect. Storing the boolean inside `io.ts` (rather than on
+   `TuiContext`) keeps `TuiContext` smaller and makes the header
+   counter process-global — correct because only one turn can be
+   in flight at a time.
+9. **Corrupt-JSON files are left in place.** Both `memory-store.ts`
+   and `model-store.ts` log a warning and treat the file as absent,
+   but do NOT delete or overwrite the bad file. The user keeps the
+   chance to recover it manually.
+10. **`parseSlashCommand` normalizes the command to lowercase**; the
+    tokenizer accepts mixed-case input like `/Help`. Command names
+    are case-insensitive; arguments are case-preserving.
+11. **Windows `clip.exe` detection** tries the binary on `$PATH`
+    first, then falls back to the full WSL-safe path
+    `/mnt/c/Windows/System32/clip.exe`. If both fail → `{ ok: false,
+    reason: "clipboard not available on this platform" }`.
+
+Absolute output path: `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/project-design.md`
+

@@ -992,6 +992,14 @@ export async function main(argv: string[]): Promise<number> {
       '--env-file <path>',
       'Path to a .env file to load (overrides the default cwd/.env lookup). Process env always wins.',
     )
+    .option(
+      '--agent-memory-file <path>',
+      'Path to the user-memory JSON file (default $HOME/.outlook-cli/agent-memory.json)',
+    )
+    .option(
+      '--agent-model-file <path>',
+      'Path to the saved-model JSON file (default $HOME/.outlook-cli/agent-model.json)',
+    )
     .option('--verbose', 'Emit per-step trace to stderr', false)
     .action(
       makeAction<
@@ -1007,6 +1015,8 @@ export async function main(argv: string[]): Promise<number> {
           perToolBudget?: number;
           allowMutations?: boolean;
           envFile?: string;
+          agentMemoryFile?: string;
+          agentModelFile?: string;
           verbose?: boolean;
         },
         [string | undefined]
@@ -1023,6 +1033,8 @@ export async function main(argv: string[]): Promise<number> {
           perToolBudgetBytes: cmdOpts.perToolBudget,
           allowMutations: cmdOpts.allowMutations ?? false,
           envFile: cmdOpts.envFile,
+          agentMemoryFile: cmdOpts.agentMemoryFile,
+          agentModelFile: cmdOpts.agentModelFile,
           verbose: cmdOpts.verbose ?? false,
           logFile: g.logFile,
           noAutoReauth: g.autoReauth === false,

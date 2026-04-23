@@ -14,6 +14,7 @@
 // path (after verifying it exists) on `AgentConfig.envFilePath`.
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { UsageError } from '../commands/list-mail';
@@ -66,6 +67,10 @@ export interface AgentConfigFlags {
   envFile?: string;
   verbose?: boolean;
   interactive?: boolean;
+  /** Override for the on-disk agent memory file (see §TUI.7). */
+  agentMemoryFile?: string;
+  /** Override for the on-disk agent model-preference file (see §TUI.7). */
+  agentModelFile?: string;
 }
 
 /**
@@ -88,6 +93,27 @@ export interface AgentConfig {
   /** Frozen snapshot of every `OUTLOOK_AGENT_<PROVIDER>_*` env var set at
    *  call-time, for the selected provider. Consumed by Unit 3 factories. */
   readonly providerEnv: Readonly<Record<string, string>>;
+  /** Absolute path to the agent memory JSON file (see design §TUI.7).
+   *  Default: `$HOME/.outlook-cli/agent-memory.json`. */
+  readonly memoryFile: string;
+  /** Absolute path to the agent model-preference JSON file (see §TUI.7).
+   *  Default: `$HOME/.outlook-cli/agent-model.json`. */
+  readonly modelFile: string;
+}
+
+/**
+ * Optional second parameter to `loadAgentConfig`. Every field is additive —
+ * single-arg callers continue to work unchanged (see design §TUI.14 #4).
+ */
+export interface AgentConfigOverrides {
+  /** Explicit values that take precedence over CLI flags, env, and
+   *  defaults. Typed as `AgentConfigFlags` so the same validators fire. */
+  readonly overrides?: Partial<AgentConfigFlags>;
+  /** Provider-specific env overrides — merged into the `providerEnv`
+   *  snapshot for the duration of this call only. Does NOT mutate
+   *  `process.env`. Used by `/model` to pass typed `--flag` values into
+   *  Unit 3 provider factories. */
+  readonly providerEnvOverrides?: Readonly<Record<string, string>>;
 }
 
 /** Frozen empty env snapshot. Exported for test ergonomics. */
@@ -104,6 +130,12 @@ const DEFAULTS = {
   TEMPERATURE: 0,
   PER_TOOL_BUDGET_BYTES: 16384,
   ALLOW_MUTATIONS: false,
+  // §TUI.7 — on-disk paths for the TUI memory + model-preference files.
+  // Defaults are computed per-call (not at module load) because
+  // `os.homedir()` must run at call time.
+  MEMORY_FILENAME: 'agent-memory.json',
+  MODEL_FILENAME: 'agent-model.json',
+  OUTLOOK_CLI_DIR: '.outlook-cli',
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -121,6 +153,8 @@ const ENV = {
   PER_TOOL_BUDGET_BYTES: 'OUTLOOK_AGENT_PER_TOOL_BUDGET_BYTES',
   TOOL_OUTPUT_BUDGET_BYTES: 'OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES',
   ALLOW_MUTATIONS: 'OUTLOOK_AGENT_ALLOW_MUTATIONS',
+  MEMORY_FILE: 'OUTLOOK_AGENT_MEMORY_FILE',
+  MODEL_FILE: 'OUTLOOK_AGENT_MODEL_FILE',
 } as const;
 
 /** Provider → env-var prefix for the `providerEnv` snapshot. */
@@ -235,9 +269,12 @@ function readEnv(name: string): string | undefined {
   return v;
 }
 
-/** Build the frozen providerEnv snapshot for the selected provider. */
+/** Build the frozen providerEnv snapshot for the selected provider.
+ *  `overrides`, when supplied, is layered on top of the process.env scan.
+ *  `process.env` is never mutated. */
 function buildProviderEnv(
   provider: ProviderName,
+  overrides?: Readonly<Record<string, string>>,
 ): Readonly<Record<string, string>> {
   const out: Record<string, string> = {};
   const primaryPrefix = PROVIDER_ENV_PREFIX[provider];
@@ -256,7 +293,33 @@ function buildProviderEnv(
       }
     }
   }
+  if (overrides) {
+    for (const [k, v] of Object.entries(overrides)) {
+      out[k] = v;
+    }
+  }
   return Object.freeze(out);
+}
+
+/**
+ * Resolve an optional on-disk agent file path with the standard precedence:
+ *   CLI flag > env var > default (`$HOME/.outlook-cli/<defaultFilename>`).
+ * The return value is always an absolute path.
+ */
+function resolveAgentFile(
+  flagValue: string | undefined,
+  envVarName: string,
+  defaultFilename: string,
+): string {
+  const raw =
+    (typeof flagValue === 'string' && flagValue !== ''
+      ? flagValue
+      : undefined) ?? readEnv(envVarName);
+  if (raw !== undefined) {
+    return path.resolve(raw);
+  }
+  // Default: $HOME/.outlook-cli/<filename>.
+  return path.join(os.homedir(), DEFAULTS.OUTLOOK_CLI_DIR, defaultFilename);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,12 +335,23 @@ function buildProviderEnv(
  * Mandatory rows (provider, model) raise `ConfigurationError` if unresolved.
  * Invalid flag/env values raise `UsageError` (exit 2).
  */
-export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
+export function loadAgentConfig(
+  flags: AgentConfigFlags,
+  opts?: AgentConfigOverrides,
+): AgentConfig {
+  // 0. Merge overrides into the effective flag set. Overrides win over the
+  //    CLI flags (design §TUI.14 #4). The overrides object is `Partial<...>`
+  //    so unset keys do not clobber values set on `flags`.
+  const effective: AgentConfigFlags = {
+    ...flags,
+    ...(opts?.overrides ?? {}),
+  };
+
   // 1. envFilePath — verify existence if explicit --env-file was supplied.
   //    Dotenv loading already happened in the caller; we just record the path.
   let envFilePath: string | null = null;
-  if (typeof flags.envFile === 'string' && flags.envFile !== '') {
-    const abs = path.resolve(flags.envFile);
+  if (typeof effective.envFile === 'string' && effective.envFile !== '') {
+    const abs = path.resolve(effective.envFile);
     if (!fs.existsSync(abs)) {
       throw new ConfigurationError(
         'envFile',
@@ -290,8 +364,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
 
   // 2. provider — mandatory.
   const providerRaw =
-    (typeof flags.provider === 'string' && flags.provider !== ''
-      ? flags.provider
+    (typeof effective.provider === 'string' && effective.provider !== ''
+      ? effective.provider
       : undefined) ?? readEnv(ENV.PROVIDER);
   if (providerRaw === undefined) {
     throw new ConfigurationError('OUTLOOK_AGENT_PROVIDER', [
@@ -318,8 +392,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
   const checkedModelSources = ['--model', 'OUTLOOK_AGENT_MODEL'];
   if (providerModelFallbackName) checkedModelSources.push(providerModelFallbackName);
   const model =
-    (typeof flags.model === 'string' && flags.model !== ''
-      ? flags.model
+    (typeof effective.model === 'string' && effective.model !== ''
+      ? effective.model
       : undefined) ??
     readEnv(ENV.MODEL) ??
     (providerModelFallbackName ? readEnv(providerModelFallbackName) : undefined);
@@ -329,8 +403,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
 
   // 4. maxSteps — optional, default 10.
   let maxSteps: number;
-  if (typeof flags.maxSteps === 'number') {
-    maxSteps = parsePositiveInt(flags.maxSteps, '--max-steps');
+  if (typeof effective.maxSteps === 'number') {
+    maxSteps = parsePositiveInt(effective.maxSteps, '--max-steps');
   } else {
     const raw = readEnv(ENV.MAX_STEPS);
     maxSteps =
@@ -341,8 +415,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
 
   // 5. temperature — optional, default 0.
   let temperature: number;
-  if (typeof flags.temperature === 'number') {
-    temperature = parseNonNegativeFloat(flags.temperature, '--temperature');
+  if (typeof effective.temperature === 'number') {
+    temperature = parseNonNegativeFloat(effective.temperature, '--temperature');
   } else {
     const raw = readEnv(ENV.TEMPERATURE);
     temperature =
@@ -356,9 +430,9 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
   //    TOOL_OUTPUT_BUDGET_BYTES. Accept either; canonical name wins when both
   //    are set.
   let perToolBudgetBytes: number;
-  if (typeof flags.perToolBudgetBytes === 'number') {
+  if (typeof effective.perToolBudgetBytes === 'number') {
     perToolBudgetBytes = parsePositiveInt(
-      flags.perToolBudgetBytes,
+      effective.perToolBudgetBytes,
       '--per-tool-budget',
     );
   } else {
@@ -373,8 +447,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
 
   // 7. allowMutations — optional, default false.
   let allowMutations: boolean;
-  if (typeof flags.allowMutations === 'boolean') {
-    allowMutations = flags.allowMutations;
+  if (typeof effective.allowMutations === 'boolean') {
+    allowMutations = effective.allowMutations;
   } else {
     const raw = readEnv(ENV.ALLOW_MUTATIONS);
     allowMutations =
@@ -386,7 +460,7 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
   // 8. toolsAllowlist — optional; null = "no allowlist" (full permitted set).
   let toolsAllowlist: readonly string[] | null;
   const toolsRaw =
-    typeof flags.tools === 'string' ? flags.tools : readEnv(ENV.TOOLS);
+    typeof effective.tools === 'string' ? effective.tools : readEnv(ENV.TOOLS);
   if (toolsRaw === undefined) {
     toolsAllowlist = null;
   } else {
@@ -406,15 +480,15 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
   // 9. systemPrompt / systemPromptFile — mutually exclusive. Do NOT read the
   //    file here; Unit 5 handles that.
   const systemPrompt =
-    (typeof flags.systemPrompt === 'string' && flags.systemPrompt !== ''
-      ? flags.systemPrompt
+    (typeof effective.systemPrompt === 'string' && effective.systemPrompt !== ''
+      ? effective.systemPrompt
       : undefined) ??
     readEnv(ENV.SYSTEM_PROMPT) ??
     null;
   const systemPromptFile =
-    (typeof flags.systemPromptFile === 'string' &&
-    flags.systemPromptFile !== ''
-      ? flags.systemPromptFile
+    (typeof effective.systemPromptFile === 'string' &&
+    effective.systemPromptFile !== ''
+      ? effective.systemPromptFile
       : undefined) ??
     readEnv(ENV.SYSTEM_PROMPT_FILE) ??
     null;
@@ -426,13 +500,26 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
   }
 
   // 10. verbose / interactive — CLI-only flags, no env var.
-  const verbose = flags.verbose ?? false;
-  const interactive = flags.interactive ?? false;
+  const verbose = effective.verbose ?? false;
+  const interactive = effective.interactive ?? false;
 
-  // 11. providerEnv snapshot — frozen.
-  const providerEnv = buildProviderEnv(provider);
+  // 11. providerEnv snapshot — frozen. providerEnvOverrides from `opts` are
+  //     layered on top without touching process.env.
+  const providerEnv = buildProviderEnv(provider, opts?.providerEnvOverrides);
 
-  // 12. Assemble and freeze.
+  // 12. memoryFile / modelFile — §TUI.7 plumbing defaults.
+  const memoryFile = resolveAgentFile(
+    effective.agentMemoryFile,
+    ENV.MEMORY_FILE,
+    DEFAULTS.MEMORY_FILENAME,
+  );
+  const modelFile = resolveAgentFile(
+    effective.agentModelFile,
+    ENV.MODEL_FILE,
+    DEFAULTS.MODEL_FILENAME,
+  );
+
+  // 13. Assemble and freeze.
   const cfg: AgentConfig = {
     provider,
     model,
@@ -447,6 +534,8 @@ export function loadAgentConfig(flags: AgentConfigFlags): AgentConfig {
     verbose,
     interactive,
     providerEnv,
+    memoryFile,
+    modelFile,
   };
   return Object.freeze(cfg);
 }

@@ -62,7 +62,7 @@
 
 ## Project-specific exceptions to global rules
 
-### Exception — defaults allowed for three runtime-plumbing config settings
+### Exception — defaults allowed for five runtime-plumbing config settings
 
 On 2026-04-21 the user explicitly asked me to introduce defaults for three
 settings that the refined spec §8 had marked "mandatory, no default":
@@ -87,6 +87,20 @@ is recorded here.
 
 Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
 `resolveOptionalInt` / `resolveOptionalString` helpers).
+
+On 2026-04-23 the user additionally approved defaults for two more
+settings introduced by the Agent Interactive TUI (plan-004):
+
+- `memoryFile` — default `$HOME/.outlook-cli/agent-memory.json`. Env:
+  `OUTLOOK_AGENT_MEMORY_FILE`. Flag: `--agent-memory-file`.
+- `modelFile` — default `$HOME/.outlook-cli/agent-model.json`. Env:
+  `OUTLOOK_AGENT_MODEL_FILE`. Flag: `--agent-model-file`.
+
+Rationale: identical to the original three — these are local on-disk
+paths, not secrets or environment-distinguishing identities. Implementation
+lands in `src/config/agent-config.ts` alongside the existing helpers; the
+`AgentConfig` type gains `memoryFile: string` and `modelFile: string`
+(both resolved to absolute paths at load time).
 
 ## Tools
 
@@ -547,6 +561,137 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
           requires the explicit `--allow-mutations` flag AND the agent
           system prompt still asks for user confirmation before any
           irreversible action.
+
+        Interactive TUI (plan-004):
+
+        When `--interactive` (or `-i`) is set, the `agent` subcommand
+        launches a raw-mode terminal UI (runTui) instead of a readline
+        REPL. It streams tokens as they arrive from the LLM, renders tool
+        calls inline, and exposes slash commands for memory, model
+        swapping, history navigation, and clipboard export.
+
+        Banner (emitted to stderr on startup, 5 lines):
+          1. Product line (`Outlook Agent — interactive (plan-004)`).
+          2. Active provider + model summary.
+          3. Memory file path + item count.
+          4. Key help hint (`/help for commands, /quit to exit`).
+          5. Blank separator line before the first prompt.
+
+        Slash commands (parsed before the input is forwarded to the
+        model):
+          - `/help`                         Print the full command list.
+          - `/history`                      Print prior user turns in this
+                                            session (numbered).
+          - `/state`                        Print provider, model, thread
+                                            id, memory size, session
+                                            counters.
+          - `/memory`                       List persisted user-memory
+                                            entries (numbered).
+          - `/memory add <text>`            Append an entry to the
+                                            memory file.
+          - `/memory remove <N>`            Remove entry N (1-indexed).
+          - `/memory clear`                 Wipe the entire memory file
+                                            (asks for confirmation).
+          - `/new` (alias `/reset`)         Start a new thread — resets
+                                            the MemorySaver + thread id.
+          - `/last` (alias `/raw`)          Reprint the last assistant
+                                            message (raw, no streaming).
+          - `/copy`                         Copy the last assistant
+                                            message to the clipboard.
+          - `/copy-all`                     Copy the full transcript
+                                            (all turns + tool calls).
+          - `/model`                        Show the currently active
+                                            provider + model.
+          - `/model <provider> [--flag v]*` Switch provider / model / any
+                                            `AgentConfigFlags` field
+                                            mid-session. Persists to the
+                                            saved-model file so the next
+                                            startup uses the override.
+          - `/model reset`                  Drop the saved-model file and
+                                            rebuild from the startup
+                                            `AgentConfigFlags`.
+          - `/monitor`                      STUBBED this iteration — see
+                                            Limitations below.
+          - `/quit` (alias `/exit`)         Exit the TUI cleanly.
+
+        New CLI flags (forwarded by `commands/agent.ts` into
+        `AgentConfigFlags` and resolved by `loadAgentConfig`):
+          - `--agent-memory-file <path>`   Override the user-memory file.
+                                           Env: `OUTLOOK_AGENT_MEMORY_FILE`.
+                                           Default:
+                                           `$HOME/.outlook-cli/agent-memory.json`.
+          - `--agent-model-file <path>`    Override the saved-model file.
+                                           Env: `OUTLOOK_AGENT_MODEL_FILE`.
+                                           Default:
+                                           `$HOME/.outlook-cli/agent-model.json`.
+
+        New env vars:
+          - `OUTLOOK_AGENT_MEMORY_FILE`    Source of truth for
+                                           `--agent-memory-file` when the
+                                           flag is unset.
+          - `OUTLOOK_AGENT_MODEL_FILE`     Source of truth for
+                                           `--agent-model-file` when the
+                                           flag is unset.
+
+        Persistence files (both mode 0600 inside the 0700 parent dir
+        `$HOME/.outlook-cli/`):
+          - `agent-memory.json`            User-memory store. Survives
+                                           across sessions; prepended to
+                                           every system prompt.
+          - `agent-model.json`             Saved-model override. When
+                                           present, overrides
+                                           `AgentConfigFlags` at startup
+                                           (provider/model/max-steps/etc).
+                                           `/model reset` deletes it.
+
+        Keybindings:
+          - `Enter`                        Submit the current input.
+          - `Shift+Enter` / `Ctrl+J`       Insert a literal newline.
+          - `ESC` / `Ctrl+C` (while an     Abort the in-flight response
+            answer streams)                (the partial output stays on
+                                           screen; the thread keeps the
+                                           interrupted turn).
+          - `Ctrl+C` (on empty input)      Cancel the current edit (does
+                                           not exit).
+          - `Ctrl+D` (on empty input)      Exit the TUI (equivalent to
+                                           `/quit`).
+          - `↑` / `↓` at top/bottom edge   Navigate prior user turns.
+          - `Home` / `End` / `Ctrl+A`      Motion — start / end of line.
+            / `Ctrl+E`
+          - `Option+←/→` (macOS) /         Motion — word boundaries.
+            `Ctrl+←/→`
+          - `Ctrl+W`                       Delete word backwards.
+          - `Ctrl+U`                       Delete to start of line.
+          - `Ctrl+K`                       Delete to end of line.
+          - `Alt+Backspace` /              Delete word backwards
+            `Cmd+Backspace`                (additional synonyms).
+
+        Streaming contract:
+          - Tokens render inline as they arrive from the LLM (no line
+            buffering).
+          - A braille spinner (`⠋⠙⠹⠸…`) indicates thinking when the model
+            is producing reasoning without emitting visible tokens.
+          - When the model issues a tool call, the TUI prints
+            `↳ calling <tool>(...)` on its own line before the tool runs
+            and `✓` once the tool returns (appended to the same line).
+
+        Clipboard dispatch order (tried in order on `/copy` and
+        `/copy-all`):
+          1. macOS → `pbcopy`.
+          2. Linux → `xclip -selection clipboard` → `xsel --clipboard`.
+          3. WSL   → `clip.exe`.
+          If none are available, the user sees the message
+          `"clipboard not available on this platform"` and the transcript
+          stays on screen.
+
+        Limitations:
+          - `/monitor` is stubbed this iteration
+            (`src/agent/tui/commands/monitor.ts` prints
+            `"monitoring disabled (built-in monitoring not yet available)"`).
+            The spec at `prompts/004-agent-tui-spec.md` §2.3 / §11
+            describes a richer version with thread counters, tool-use
+            stats, token totals, and a JSONL log — tracked as a pending
+            item in `Issues - Pending Items.md`.
     </info>
 </agent>
 

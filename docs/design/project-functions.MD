@@ -513,3 +513,203 @@ recommends `DeepSeek-V3.2` or `DeepSeek-V3.1`.
 
 **Source.** Research `docs/research/azure-deepseek-tool-calling.md` §7;
 investigation §7 Risk 3.
+
+---
+
+## F-TUI — Agent Interactive TUI
+
+**Status:** planned (2026-04-23), replaces the readline-based interactive
+mode in `src/agent/run.ts#runInteractive`. Spec source:
+`prompts/004-agent-tui-spec.md`. Plan: `docs/design/plan-004-agent-tui.md`.
+One-shot mode (`runOneShot`) is untouched.
+
+### F-TUI.1  Banner
+
+Printed once at startup and re-rendered after `/new`, `/reset`, `/model`,
+and `/model reset`.
+
+- **Line 1 (bold):** `Outlook Agent CLI (LangGraph)` — adapted from the
+  spec's `NotebookLM Agent CLI` to this project's identity.
+- **Line 2 (dim):** `LLM: <provider display name>` — e.g.
+  `LLM: Azure OpenAI (gpt-4o)` or `LLM: OpenAI (gpt-4o-mini)`.
+- **Line 3 (dim, conditional):** `Monitoring: <level> → <path>` — hidden
+  while monitoring is stubbed (see F-TUI.7).
+- **Line 4 (dim):** `Session: <first 8 chars of thread id>`.
+- **Line 5 (dim):** `Commands: /history /memory /new /last /quit /help`.
+- **Line 6 (dim):** `Shift+Enter or Ctrl+J for newline, Enter to send`.
+- First-line prompt: `You> ` (green). Continuation prompt: ` .. ` (green).
+
+### F-TUI.2  Input keybindings
+
+Raw-mode stdin (`process.stdin.setRawMode(true)`); NOT `readline`. If
+`!process.stdin.isTTY`, exit 2 with `"stdin is not a TTY"`.
+
+**Submit / Cancel / Exit:**
+- `Enter` (CR, `0x0D`) — submit: resolve with `lines.join("\n")`.
+- `Shift+Enter` / `Ctrl+J` (LF, `0x0A`) — insert newline. Kitty variant
+  `\x1b[13;2u` and terminal variant `\x1bOM` also accepted.
+- `Ctrl+C` (`0x03`) during input — reject with `"SIGINT"` (cancel edit).
+  During execution — abort via `AbortController`.
+- `Ctrl+D` (`0x04`) on empty input — reject with `"EOF"` → exit.
+- `ESC` during execution — abort the stream.
+
+**Navigation:**
+- `←` / `→` — cursor horizontal (within current line).
+- `↑` / `↓` — move between lines of the current multi-line input; at the
+  top/bottom edge they navigate **input history**.
+- `Option+←/→` (`\x1b[1;3D` / `\x1b[1;3C`) — word motion.
+- `Ctrl+←/→` (`\x1b[1;5D` / `\x1b[1;5C`) — word motion.
+- Legacy `Alt+b` / `Alt+f` — word left / right.
+- `Home`/`End` (`\x1b[H` / `\x1b[F` / `\x1bOH` / `\x1bOF` / `\x1b[1~` /
+  `\x1b[4~`) — line start / end.
+- `Cmd+←/→` (`\x1b[1;9D` / `\x1b[1;9C`; iTerm2 variants
+  `\x1b[1;2H` / `\x1b[1;2F`) — line start / end.
+- `Ctrl+A` / `Ctrl+E` — line start / end.
+
+**Editing:**
+- `Backspace` (`0x7F` / `0x08`) — delete prev char; at column 0, merge
+  with previous line.
+- `Delete` key (`\x1b[3~`) — delete char at cursor.
+- `Ctrl+W` (`0x17`) / `Alt+Backspace` (`\x1b` + `0x7F`) — delete word
+  backwards.
+- `Ctrl+U` (`0x15`) — delete to start of line.
+- `Ctrl+K` (`0x0B`) — delete to end of line.
+- `Cmd+Backspace` (`\x1b[3;9~`) — delete to start of line.
+
+**Input history:**
+- In-memory `string[]`, lost on exit. Submitted non-empty inputs are
+  pushed; consecutive duplicates are suppressed.
+
+Escape-buffer accumulator discards any sequence longer than 10 bytes.
+
+### F-TUI.3  Streaming output contract
+
+Uses LangGraph v2 events:
+`graph.streamEvents(input, { version: "v2", configurable: { thread_id },
+signal, callbacks })`. Only three event types are consumed:
+
+| Event | Payload | Action |
+|---|---|---|
+| `on_chat_model_stream` | `data.chunk.content: string` | Stop spinner, print `Agent` header ONCE (bold cyan), write chunk to stdout, append to `agentText`. |
+| `on_tool_start` | `name: string` | Stop spinner, print header once (no trailing space in this branch), print `\n  ↳ calling <name>(...)`. |
+| `on_tool_end` | — | Append ` ✓`, restart spinner with label `Processing tool result...`. |
+
+Other events are ignored.
+
+**Spinner:** braille frames `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` at 80 ms tick, on its own line,
+wrapped in ANSI save/restore. Label mutates (`Thinking...` →
+`Processing tool result...` etc.). Single active instance at a time.
+
+**Abort semantics:** `ESC` and `Ctrl+C` during execution call
+`abort.abort()`; the `signal` is propagated into `streamEvents`. On
+abort, the spinner stops and `[interrupted]` prints in dim yellow. On
+success, a plain trailing newline.
+
+**Budgets:** `perToolBudgetBytes` (16 KB, env
+`OUTLOOK_AGENT_PER_TOOL_BUDGET_BYTES`) still caps tool results
+injected into the LLM context. The on-screen `↳ calling foo(...) ✓`
+indicator never prints tool output and is NOT affected by this budget.
+
+### F-TUI.4  Slash commands
+
+All begin with `/`. Dispatch happens before any agent turn is started.
+
+- `/help` — print command list + keybinding summary.
+- `/history` — print local (user↔agent) conversation mirror; each
+  message truncated to 200 chars.
+- `/state` — print agent server-side state:
+  `graph.getState({ configurable: { thread_id } })` — thread id,
+  domain state fields, message count.
+- `/memory` — list persistent user instructions (1-indexed).
+- `/memory add <text>` — append instruction; persists to memory file
+  immediately; takes effect on the NEXT turn.
+- `/memory remove <N>` — remove Nth instruction (1-indexed).
+- `/memory clear` — wipe all instructions.
+- `/new` (alias `/reset`) — new thread id (`generateId()`), clear local
+  history + input history, close and recreate monitoring stub.
+- `/last` (alias `/raw`) — print `lastRawResponse` verbatim.
+- `/copy` — copy last agent response via platform clipboard
+  (`pbcopy`/`xclip`/`xsel`/`clip.exe`). If no tool is detected, print
+  `"clipboard not available on this platform"`.
+- `/copy-all` — copy entire conversation formatted as
+  `You: …\n\nAgent: …`.
+- `/model` — show current LLM provider + resolved config with API keys
+  masked (format `sk-abc…xyz`).
+- `/model <provider> [--flag value ...]` — switch provider at runtime.
+  Tokenizer regex `/(?:[^\s"]+|"[^"]*")/g` (quoted values supported).
+  `resolveParam(flag, envVar) = flags.get(flag) ?? process.env[envVar] ??
+  null`. Missing required params → user-visible error, no switch. On
+  success: rebuild graph via `loadAgentConfig({ overrides })`, persist
+  to `agent-model.json`, reset thread id, clear local history, recreate
+  monitoring stub. **This is the only code path in the TUI that reads
+  `process.env` directly.**
+- `/model reset` — delete `agent-model.json`, reload config from env,
+  rebuild graph + reset thread.
+- `/monitor` — **stub this iteration:** prints
+  `"monitoring disabled (built-in monitoring not yet available)"` via
+  the existing logger. Rich summary deferred (see F-TUI.7).
+- `/quit` (alias `/exit`) — close logger, clear spinner, disable raw
+  mode, `process.exit(0)`.
+
+Blocked while a turn is in flight: `/model <provider>`, `/model reset`,
+`/new`, `/reset`. The TUI prints a user-visible
+`"cannot <action> while a turn is in flight"` message instead.
+
+### F-TUI.5  Persistence
+
+| Artifact | Default location | Override (env) | Override (flag) | Mode | On missing |
+|---|---|---|---|---|---|
+| User memory | `$HOME/.outlook-cli/agent-memory.json` | `OUTLOOK_AGENT_MEMORY_FILE` | `--agent-memory-file <path>` | 0600 | treat as EMPTY (not a config error) |
+| Model override | `$HOME/.outlook-cli/agent-model.json` | `OUTLOOK_AGENT_MODEL_FILE` | `--agent-model-file <path>` | 0600 | treat as ABSENT (fall through to env via `loadAgentConfig`) |
+| Input history | in-memory | — | — | n/a | lost on exit |
+| Monitoring JSONL | deferred (see F-TUI.7) | — | — | — | — |
+
+Both files are written atomically (write tmp → fsync → rename) under the
+0700 parent profile dir (`$HOME/.outlook-cli/`), modeled after
+`src/session/store.ts`. Corrupt JSON logs a warning (redacted by the
+existing logger) and falls back to EMPTY / ABSENT respectively.
+
+`agent-model.json` is loaded BEFORE env config — a saved override wins
+over env. `/model reset` deletes it.
+
+User memory entries are injected into the system prompt each turn as a
+`<user-instructions>` block appended to whatever `loadSystemPrompt`
+returns. `src/agent/system-prompt.ts` itself is not modified — the
+concatenation happens in the TUI layer.
+
+### F-TUI.6  Configuration surface
+
+New CLI flags on the `agent` subcommand:
+- `--agent-memory-file <path>` — override memory file path. Env:
+  `OUTLOOK_AGENT_MEMORY_FILE`.
+- `--agent-model-file <path>` — override model-store file path. Env:
+  `OUTLOOK_AGENT_MODEL_FILE`.
+
+**Precedence** (both flags): CLI flag > env var > default. Defaults are
+allowed for these two paths under the same rationale as the existing
+three-setting defaults exception in CLAUDE.md — they are operational
+plumbing, not secrets or environment-distinguishing identities. The
+project CLAUDE.md's exception section is amended accordingly as part of
+plan-004 Phase J.
+
+All other config continues to flow through `loadAgentConfig`, which
+already obeys the no-fallback rule for mandatory settings and the
+documented three-setting defaults. No new raw `process.env` reads in
+TUI code except inside `/model`'s `resolveParam` helper.
+
+### F-TUI.7  Non-goals / deferred
+
+- **Rich `/monitor` output** — turns, LLM calls, tool calls, token
+  totals, latency, tool frequency, log path. Stubbed this iteration;
+  TODO captured in `Issues - Pending Items.md`. Requires a
+  `src/agent/monitoring/*` module (callback handler, logger, summary
+  builders) that does not yet exist.
+- **JSONL monitoring logs** — one file per session. Deferred with
+  `/monitor`; file path would be shown as banner line 3 once enabled.
+- **PTY smoke test harness** (spec §14) — optional, deferred; unit tests
+  cover `replaceInput`, `insertNewline`, `handleBackspace`,
+  `redrawCurrentLine` directly.
+- **Encrypted model-store** — `agent-model.json` may contain
+  provider-specific secrets entered on a `/model ...` line. File mode
+  is 0600 but the content is plaintext. Future hardening tracked in
+  Issues - Pending Items.
