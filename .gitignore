@@ -6,3 +6,8 @@ dist/
 outlook_report.json
 coverage/
 *.log
+
+# Agent subcommand (Plan 003) — env files
+.env
+.env.*
+!.env.example

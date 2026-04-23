@@ -2830,6 +2830,138 @@ folder feature scope.
 
 ---
 
+## 11. Threads, date-range filtering, and server-side counting
+
+Features added after the folder-management chapter landed. Additive to §2.8
+(`OutlookClient`) and §2.13.3 (`list-mail`); no new top-level modules. Shipped
+in versions [1.2.0] and [1.3.0] (see `CHANGELOG.md`).
+
+### 11.1 Scope
+
+Three related capabilities, each reusing the existing HTTP/session/auth
+pipeline without new subsystems:
+
+1. **Date-range filter on `list-mail`** — `--from <iso|keyword>` /
+   `--to <iso|keyword>` build an OData `$filter=ReceivedDateTime ge X and
+   ReceivedDateTime lt Y` threaded through all three folder resolution paths
+   (fast-path alias, `--folder-id`, resolver).
+2. **Thread retrieval** — new `get-thread <id>` subcommand walks a message's
+   `ConversationId` and returns every message in that thread regardless of
+   folder.
+3. **Server-side count** — new `--just-count` flag on `list-mail` asks Outlook
+   for just the count via `$count=true&$top=1` (constant-cost regardless of
+   folder size; no client-side paging).
+
+### 11.2 Module additions
+
+| File | Change | Purpose |
+|---|---|---|
+| `src/util/dates.ts` | **new** | Shared timestamp parser. `parseTimestamp(raw)` accepts ISO8601, space-separated local time, and the keyword grammar `now` / `now + Nd` / `now - Nd`. Returns a discriminated `{ ok: true, iso } | { ok: false, reason }` so callers can attach command-specific error prefixes. `list-calendar`'s `resolveCalendarDate` delegates to it. |
+| `src/commands/get-thread.ts` | **new** | Command handler. `run(deps, idOrConv, opts)` returns `{ conversationId, count, messages[] }`. |
+| `src/http/types.ts` | extended | `MessageSummary.ConversationId?: string` added (optional — only surfaced when `$select` requests it). `ODataListResponse.'@odata.count'?: number` added. |
+| `src/http/outlook-client.ts` | extended | Two new public methods: `listMessagesByConversation(conversationId, opts?)` and `countMessagesInFolder(folderId, opts?)`. `listMessagesInFolder` gains an optional `filter?: string` field. All three route through the existing `doRequest`/`withAutoReauth` pipeline. |
+| `src/commands/list-mail.ts` | extended | `ListMailOptions` gains `from?`, `to?`, `justCount?`. `run()` return widens to `MessageSummary[] \| ListMailCountResult`. New internal helper `buildReceivedDateFilter(from, to)` produces the `$filter` string or `undefined`. |
+| `src/cli.ts` | extended | Registers `--from` / `--to` / `--just-count` on list-mail; registers the `get-thread` subcommand with `--body` / `--order`. The list-mail action handler discriminates `Array.isArray(result)` to pick JSON vs. table rendering. |
+
+### 11.3 Date-window grammar
+
+Both `--from` and `--to` accept, identically, any of:
+
+1. ISO8601 UTC: `YYYY-MM-DDTHH:MM:SSZ` — e.g. `2026-04-01T00:00:00Z`.
+2. Space-separated local time: `YYYY-MM-DD HH:MM:SS` — e.g. `2026-04-01 00:00:00`.
+3. Keyword: `now` | `now + Nd` | `now - Nd` (whitespace-insensitive, case-insensitive).
+
+Lower bound is **inclusive** (`ge`), upper bound is **exclusive** (`lt`).
+Rationale: day-aligned adjacent windows don't overlap
+(`--from 2026-04-01T00:00:00Z --to 2026-05-01T00:00:00Z` covers all of April).
+
+Either, both, or neither bound may be set. Malformed input → `UsageError`
+(exit 2) with a `list-mail:` message prefix.
+
+### 11.4 Thread retrieval algorithm
+
+```
+run(id):
+  if id startsWith "conv:":
+    conversationId = id.slice(5)  # skip the resolve hop
+  else:
+    msg = GET /api/v2.0/me/messages/{id}?$select=Id,ConversationId
+    if msg.ConversationId empty → UsageError
+    conversationId = msg.ConversationId
+
+  messages = GET /api/v2.0/me/messages
+             ?$filter=ConversationId eq '<escaped>'
+             &$orderby=ReceivedDateTime <order>
+             &$select=<base ± Body,BodyPreview>
+
+  return { conversationId, count: messages.length, messages }
+```
+
+OData string literal escaping: single quotes in the value are doubled
+(`'` → `''`). Outlook ConversationIds are base64-safe so this is defensive.
+
+### 11.5 Server-side count algorithm
+
+```
+run(--just-count):
+  folderId = <resolve via the existing three paths>
+  resp = GET /api/v2.0/me/MailFolders/{folderId}/messages
+         ?$count=true&$top=1&$select=Id[&$filter=<window>]
+  if resp['@odata.count'] is a finite number:
+    return { count: resp['@odata.count'], exact: true }
+  else:
+    return { count: resp.value.length, exact: false }
+```
+
+`--just-count` **ignores** `--top` and `--select` — the flag is about
+"how many match", not "show me N". The `--top` range-validation step is
+skipped in count mode so values like `--top 5000` do not raise a
+`UsageError` when paired with `--just-count`.
+
+### 11.6 Interaction matrix — `list-mail`
+
+Every combination of folder flag × date window × just-count is valid:
+
+| Folder path | Date window | Count mode | Terminal call |
+|---|---|---|---|
+| `--folder <fast-alias>` | optional | — | `client.get(/MailFolders/{alias}/messages, …)` |
+| `--folder <fast-alias>` | optional | `--just-count` | `client.countMessagesInFolder(alias, {filter})` |
+| `--folder-id <raw>` | optional | — | `client.listMessagesInFolder(id, {filter, …})` |
+| `--folder-id <raw>` | optional | `--just-count` | `client.countMessagesInFolder(id, {filter})` |
+| `--folder <path>` [+ `--folder-parent`] | optional | — | resolve → `client.listMessagesInFolder(resolvedId, {filter, …})` |
+| `--folder <path>` [+ `--folder-parent`] | optional | `--just-count` | resolve → `client.countMessagesInFolder(resolvedId, {filter})` |
+
+The existing folder-flag exclusivity rules (§10.7) remain unchanged.
+
+### 11.7 Known limitations / follow-ups
+
+- If the upstream server ignores `$count=true` (rare on v2.0 but possible on
+  some tenants), `countMessagesInFolder` falls back to `value.length` and
+  returns `exact: false`. Callers that need the authoritative total when
+  this happens would have to fetch pages — explicitly deferred.
+- `get-thread` does not resolve attachments per message; callers still use
+  `get-mail` / `download-attachments` for that.
+- No thread-level bulk operations (e.g. "move whole thread to folder X") —
+  deferred; compose `get-thread` + `move-mail` in the shell instead.
+
+### 11.8 Test coverage (as shipped)
+
+- `test_scripts/outlook-client-threads.spec.ts` — `countMessagesInFolder`
+  (4 tests), `listMessagesByConversation` (4 tests), `listMessagesInFolder.filter`
+  option (2 tests).
+- `test_scripts/commands-list-mail-daterange.spec.ts` — 7 tests covering the
+  three folder paths, malformed-input branches, and keyword grammar.
+- `test_scripts/commands-list-mail-count.spec.ts` — 6 tests covering all three
+  folder paths, `--from`/`--to` threading, `--top` skip in count mode, and
+  `exact: false` propagation.
+- `test_scripts/commands-get-thread.spec.ts` — 11 tests covering message-id
+  mode, `conv:` mode, body / order options, empty-input guards, and the
+  no-ConversationId edge case.
+
+Total suite at [1.3.0]: **240 tests** across 21 files.
+
+---
+
 ## Summary
 
 - Full, contract-grade TypeScript design spanning 14 base modules + 6 folder-feature
@@ -2848,3 +2980,1403 @@ folder feature scope.
   cover plan-002 OQ-1..OQ-4).
 
 Absolute output path: `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/project-design.md`
+
+
+# Agent Subcommand (Plan 003)
+
+Status: Designer-signed, ready for coder swarm.
+Upstream inputs: `docs/design/refined-request-langgraph-agent.md`,
+`docs/reference/codebase-scan-langgraph-agent.md`,
+`docs/design/investigation-langgraph-agent.md`,
+`docs/research/azure-deepseek-tool-calling.md`,
+`docs/design/plan-003-langgraph-agent.md`.
+Normative scope: this section is the single source of truth for every
+coder-facing interface, file boundary, config name, and ADR for the
+LangGraph ReAct agent feature. Where details are exhaustively specified
+upstream (e.g., plan §2 phase-by-phase verification commands, research
+§7.5 curl test), this section references the file rather than duplicating
+it — but every interface a coder must implement appears explicitly below.
+
+## 1. System Architecture & Control Flow
+
+```
+                  user
+                   |
+                   v
+          +------------------+
+          |  node src/cli.ts |
+          |  (commander)     |
+          +--------+---------+
+                   |
+                   | .action(...)  ── `makeAction<AgentOptions,[prompt?]>`
+                   v
+          +--------------------------+
+          |  agent action handler    |   src/cli.ts (Phase H)
+          |  - buildDeps(flags)      |     builds CommandDeps
+          |  - calls agentCmd.run(…) |
+          |  - emitResult(result,…)  |     final envelope → stdout
+          +--------+-----------------+
+                   |
+                   v
+  +------------------------------------------------+
+  |  commands/agent.ts :: run(deps, prompt, opts)  |
+  |  1. loadDotenv(opts.envFile ?? null)           |   (dotenv before env reads)
+  |  2. cfg = loadAgentConfig(opts)                |
+  |  3. await authCheck.run(deps)                  |
+  |     - status != 'ok' + noAutoReauth → AuthError
+  |     - status != 'ok' + auto-reauth → deps.doAuthCapture()
+  |  4. if (opts.interactive) return runInteractive(deps,cfg)
+  |  5. return runOneShot(deps,cfg,prompt)         |
+  +------+-----------------------------------------+
+         |
+         |      (both runners share this build path)
+         v
+  +------------------+     +------------------+     +------------------+
+  | providerRegistry |     | buildToolCatalog |     | createAgentLogger|
+  | (Phase C)        |     | (Phase D)        |     | (Phase E)        |
+  | env → model      |     | deps,cfg → tools |     | cfg → Logger     |
+  +---------+--------+     +---------+--------+     +---------+--------+
+            \                        |                        /
+             \                       v                       /
+              \             +-----------------+             /
+               +----------> | createAgentGraph | <---------+
+                            | (Phase F)        |
+                            | imports          |
+                            | createAgent from |
+                            | 'langchain' v1   |
+                            +--------+---------+
+                                     |
+               +---------------------+---------------------+
+               |                                           |
+               v                                           v
+      runOneShot(deps,cfg,prompt)            runInteractive(deps,cfg)
+      - one invoke                           - MemorySaver checkpointer
+      - thread_id = runId                    - thread_id per REPL session
+      - recursionLimit = cfg.maxSteps        - readline loop
+      - returns AgentResult                  - slash commands local
+                                             - returns void
+                       |
+                       v
+               +-----------------+
+               |  AgentResult    |   JSON envelope (FR-8)
+               +-----------------+
+                       |
+                       v
+               +----------------+
+               |  cli.ts        |   emitResult(result, mode, AGENT_TABLE_COLUMNS?)
+               +----------------+
+                       |
+                       v
+                   stdout
+```
+
+`AgentDeps` is a structural extension of `CommandDeps` (see §3). It is
+threaded top-to-bottom: `cli.ts :: makeAction` calls `buildDeps(flags)`
+and passes the resulting `CommandDeps` into `agentCmd.run(deps, prompt,
+opts)`. Every tool adapter closes over this `deps` at construction time
+(see ADR-3), so the ReAct graph never has to carry it as state.
+
+Redaction boundary. `createAgentLogger(cfg)` (§10) returns a logger whose
+`info/warn/error/debug` methods funnel every string argument and every
+string value inside their `meta` object through `redactString` from
+`src/util/redact.ts` BEFORE writing to stderr or the log file. Tool
+result payloads also flow through the byte-budget truncation helper
+(`src/agent/tools/truncate.ts`) BEFORE being handed to the LLM — so the
+LLM never sees > `cfg.perToolBudgetBytes` per tool result and never sees
+anything the logger would not have sanitized.
+
+`recursionLimit` boundary. LangGraph enforces the ReAct step ceiling via
+its own `recursionLimit` in the invoke config — NOT via a hand-rolled
+counter in our code. `runOneShot` and `runInteractive` translate
+`cfg.maxSteps` directly: `invoke(state, { configurable: { thread_id },
+recursionLimit: cfg.maxSteps })`. When LangGraph raises
+`GraphRecursionError`, the runner catches it, marks `AgentResult.meta.
+terminatedBy = "maxSteps"`, sets `truncated: true`, and returns
+`answer: null` (the LLM did not produce a final AIMessage) but exit
+code remains 0 per FR-13.
+
+## 2. Module Layout
+
+Every file listed is new unless marked `[MODIFY]`. Each file is owned by
+exactly one implementation unit (§12) to eliminate merge conflicts.
+
+```
+src/
+  cli.ts                                        [MODIFY — Phase H]
+                                                register `agent` subcommand;
+                                                add AGENT_TABLE_COLUMNS;
+                                                import agentCmd.
+
+  config/
+    agent-config.ts                             [NEW — Phase B]
+      export type ProviderName
+      export interface AgentConfig
+      export interface AgentCliFlags
+      export function loadAgentConfig(opts: AgentCliFlags): AgentConfig
+      export function loadDotenv(envFilePath: string | null): void
+
+  commands/
+    agent.ts                                    [NEW — Phase G]
+      export interface AgentDeps extends CommandDeps {}
+      export interface AgentOptions extends AgentCliFlags {...}
+      export async function run(deps, prompt, opts): Promise<AgentResult | void>
+
+  agent/
+    system-prompt.ts                            [NEW — Phase F]
+      export const DEFAULT_SYSTEM_PROMPT_TEMPLATE: string
+      export const MUTATIONS_DISABLED_CLAUSE: string
+      export const MUTATIONS_ENABLED_CLAUSE: string
+      export function renderSystemPrompt(cfg: AgentConfig,
+                                         override?: string): string
+
+    result.ts                                   [NEW — Phase F]
+      export interface AgentResult
+      export interface AgentStep
+      export interface AgentUsage
+      export interface AgentMeta
+
+    logging.ts                                  [NEW — Phase E]
+      export interface AgentLogger
+      export function createAgentLogger(cfg: AgentConfig): AgentLogger
+
+    graph.ts                                    [NEW — Phase F — SOLE importer
+                                                 of `createAgent`]
+      export interface BuildGraphOpts
+      export function createAgentGraph(opts: BuildGraphOpts): CompiledGraph
+
+    run.ts                                      [NEW — Phase F]
+      export async function runOneShot(deps, cfg, prompt): Promise<AgentResult>
+      export async function runInteractive(deps, cfg): Promise<void>
+
+    providers/
+      registry.ts                               [NEW — Phase C]
+        export type ProviderFactory
+        export type ProviderRegistry
+        export const PROVIDERS: ProviderRegistry
+        export function getProvider(name: ProviderName): ProviderFactory
+      openai.ts                                 [NEW — Phase C]
+        export const createOpenAiModel: ProviderFactory
+      anthropic.ts                              [NEW — Phase C]
+      google.ts                                 [NEW — Phase C]
+      azure-openai.ts                           [NEW — Phase C]
+      azure-anthropic.ts                        [NEW — Phase C]
+      azure-deepseek.ts                         [NEW — Phase C — denylist
+                                                 gate per §5.6]
+
+    tools/
+      registry.ts                               [NEW — Phase D]
+        export type ToolAdapterFactory
+        export function buildToolCatalog(deps, cfg): StructuredTool[]
+      truncate.ts                               [NEW — Phase D]
+        export function truncateToolResult(result, budgetBytes): string
+      auth-check-tool.ts                        [NEW — Phase D]
+        export function makeAuthCheckTool(deps, cfg): StructuredTool
+      list-mail-tool.ts                         [NEW — Phase D]
+      get-mail-tool.ts                          [NEW — Phase D]
+      get-thread-tool.ts                        [NEW — Phase D]
+      list-folders-tool.ts                      [NEW — Phase D]
+      find-folder-tool.ts                       [NEW — Phase D]
+      list-calendar-tool.ts                     [NEW — Phase D]
+      get-event-tool.ts                         [NEW — Phase D]
+      create-folder-tool.ts                     [NEW — Phase D — mutation]
+      move-mail-tool.ts                         [NEW — Phase D — mutation]
+      download-attachments-tool.ts              [NEW — Phase D — mutation]
+
+test_scripts/
+  agent-config.spec.ts                          [NEW — Phase B]
+  agent-provider-registry.spec.ts               [NEW — Phase C]
+  agent-provider-openai.spec.ts                 [NEW — Phase C]
+  agent-provider-anthropic.spec.ts              [NEW — Phase C]
+  agent-provider-google.spec.ts                 [NEW — Phase C]
+  agent-provider-azure-openai.spec.ts           [NEW — Phase C]
+  agent-provider-azure-anthropic.spec.ts        [NEW — Phase C]
+  agent-provider-azure-deepseek.spec.ts         [NEW — Phase C]
+  agent-tools.spec.ts                           [NEW — Phase D]
+  agent-tool-truncate.spec.ts                   [NEW — Phase D]
+  agent-redact.spec.ts                          [NEW — Phase E]
+  agent-graph.spec.ts                           [NEW — Phase F]
+  agent-run-oneshot.spec.ts                     [NEW — Phase F]
+  agent-run-interactive.spec.ts                 [NEW — Phase F]
+  commands-agent.spec.ts                        [NEW — Phase G]
+  agent-acceptance.spec.ts                      [NEW — Phase J]
+
+package.json                                    [MODIFY — Phase A]
+package-lock.json                               [MODIFY — Phase A]
+.gitignore                                      [MODIFY — Phase A]
+.env.example                                    [NEW — Phase A]
+CLAUDE.md                                       [MODIFY — Phase I]
+docs/design/configuration-guide.md              [MODIFY — Phase I]
+docs/design/project-functions.MD                [MODIFY — Phase I]
+README.md                                       [MODIFY — Phase I]
+Issues - Pending Items.md                       [MODIFY — Phase I]
+```
+
+Exactly ONE file imports `createAgent` from `langchain`: `src/agent/
+graph.ts`. This isolates Risk 2 (investigation §7) — swapping to
+`createReactAgent` from `@langchain/langgraph/prebuilt` is a one-file
+edit.
+
+Exactly ONE file calls `dotenv.config(...)`: `src/config/agent-config.ts`
+(via `loadDotenv`). `src/cli.ts` and `makeAction` remain dotenv-free.
+See ADR-5.
+
+## 3. Public TypeScript Interfaces
+
+All interface declarations below are normative. Coders must not add
+undeclared fields, rename fields, or change cardinality without a
+design-amendment round-trip. Field order in `AgentResult` matches
+FR-8's worked example exactly so JSON output is diff-stable.
+
+```typescript
+// ============================================================
+// src/config/agent-config.ts
+// ============================================================
+
+export type ProviderName =
+  | 'openai'
+  | 'anthropic'
+  | 'google'
+  | 'azure-openai'
+  | 'azure-anthropic'
+  | 'azure-deepseek';
+
+/**
+ * Commander-produced option object for the `agent` subcommand.
+ * Populated in `cli.ts` before `agentCmd.run(...)` is called.
+ * Mirrors the CLI surface in refined §7 one-for-one.
+ */
+export interface AgentCliFlags {
+  interactive: boolean;               // -i / --interactive
+  provider?: string;                  // --provider (validated against ProviderName)
+  model?: string;                     // --model
+  temperature?: number;               // --temperature
+  maxSteps?: number;                  // --max-steps
+  system?: string;                    // --system
+  systemFile?: string;                // --system-file
+  tools?: string;                     // --tools <csv>
+  envFile?: string;                   // --env-file
+  allowMutations: boolean;            // --allow-mutations (default false)
+  perToolBudget?: number;             // --per-tool-budget
+  verbose: boolean;                   // --verbose
+  // Inherited from global flags via `deps.config` (not re-read here):
+  //   json/table mode, quiet, noAutoReauth, logFile, sessionFile, profileDir,
+  //   tz, timeout, loginTimeout, chromeChannel.
+}
+
+/**
+ * Frozen configuration produced by loadAgentConfig(). No defaults for
+ * mandatory fields (providerName); operational tunables have defaults
+ * per §4.
+ */
+export interface AgentConfig {
+  readonly providerName: ProviderName;
+  readonly model: string | null;            // null when provider derives from env
+  readonly temperature: number;              // default 0
+  readonly maxSteps: number;                 // default 10; range [1..50]
+  readonly perToolBudgetBytes: number;       // default 16384
+  readonly envFilePath: string | null;
+  readonly allowMutations: boolean;          // default false
+  readonly systemPrompt: string | null;      // resolved text (inline > file > null→built-in)
+  readonly systemPromptFile: string | null;  // for audit/logging only
+  readonly verbose: boolean;
+  readonly quiet: boolean;                   // inherited from global --quiet
+  readonly interactive: boolean;
+  readonly toolsAllowlist: readonly string[] | null;  // null = full permitted set
+  readonly logFilePath: string | null;       // inherited from global --log-file
+  readonly runId: string;                    // crypto.randomUUID()
+}
+
+export function loadAgentConfig(opts: AgentCliFlags): AgentConfig;
+export function loadDotenv(envFilePath: string | null): void;
+
+// ============================================================
+// src/commands/agent.ts
+// ============================================================
+
+import type { CommandDeps } from '../cli';
+
+/** Structural superset of CommandDeps. No new fields in v1. */
+export interface AgentDeps extends CommandDeps {}
+
+/** Same shape as AgentCliFlags; kept as a distinct name for symmetry. */
+export interface AgentOptions extends AgentCliFlags {}
+
+export async function run(
+  deps: AgentDeps,
+  prompt: string | null,
+  opts: AgentOptions,
+): Promise<AgentResult | void>;   // void only for --interactive
+
+// ============================================================
+// src/agent/result.ts
+// ============================================================
+
+export interface AgentResult {
+  answer: string | null;              // FR-8 final answer; null on maxSteps-without-answer
+  provider: ProviderName;
+  model: string | null;
+  prompt: string;                     // truncated at 512 chars
+  steps: AgentStep[];
+  usage: AgentUsage | null;
+  meta: AgentMeta;
+}
+
+export interface AgentStep {
+  index: number;                       // 1-based
+  tool?: string;                       // snake_case tool name (omitted for pure reasoning steps)
+  args?: unknown;                      // redacted, parsed JSON args
+  result?: unknown;                    // redacted tool-result payload (may be truncated)
+  reasoning?: string;                  // optional AI content preceding the tool call
+  error?: { code: string; message: string };
+  durationMs: number;
+}
+
+export interface AgentUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export interface AgentMeta {
+  maxSteps: number;                    // echoes cfg.maxSteps
+  stepsUsed: number;                   // count of AgentStep entries that invoked a tool
+  durationMs: number;                  // total wall-clock
+  terminatedBy:                        // why the loop ended
+    | 'final-answer'
+    | 'maxSteps'
+    | 'wallClock'
+    | 'sigint'
+    | 'error';
+  runId: string;                       // mirror of cfg.runId
+  truncated: boolean;                  // true iff terminatedBy === 'maxSteps' or 'wallClock'
+}
+
+// ============================================================
+// src/agent/providers/registry.ts
+// ============================================================
+
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+
+/**
+ * Async to allow providers that need startup validation (e.g., the
+ * DeepSeek denylist regex test is synchronous, but future providers
+ * may need a network probe). Coders MUST NOT make network calls in
+ * v1; the async signature is forward-compatible.
+ */
+export type ProviderFactory = (
+  env: NodeJS.ProcessEnv,
+  cfg: Pick<AgentConfig, 'model' | 'temperature'>,
+) => Promise<BaseChatModel>;
+
+export type ProviderRegistry = Record<ProviderName, ProviderFactory>;
+
+export const PROVIDERS: ProviderRegistry;
+
+export function getProvider(name: ProviderName): ProviderFactory;
+
+// ============================================================
+// src/agent/tools/registry.ts
+// ============================================================
+
+import type { StructuredTool } from '@langchain/core/tools';
+
+export type ToolAdapterFactory = (
+  deps: AgentDeps,
+  cfg: AgentConfig,
+) => StructuredTool;
+
+export function buildToolCatalog(
+  deps: AgentDeps,
+  cfg: AgentConfig,
+): StructuredTool[];
+
+// ============================================================
+// src/agent/graph.ts
+// ============================================================
+
+import type { Runnable } from '@langchain/core/runnables';
+import type { MemorySaver } from '@langchain/langgraph';
+
+export interface BuildGraphOpts {
+  model: BaseChatModel;
+  tools: StructuredTool[];
+  systemPrompt: string;
+  checkpointer?: MemorySaver;
+}
+
+/**
+ * Returns a LangGraph-compiled runnable. The type alias `CompiledGraph`
+ * is shorthand for `Runnable<{ messages: BaseMessage[] }, { messages:
+ * BaseMessage[] }>`; coders may use `Runnable` directly.
+ */
+export type CompiledGraph = Runnable;
+
+export function createAgentGraph(args: BuildGraphOpts): CompiledGraph;
+
+// ============================================================
+// src/agent/run.ts
+// ============================================================
+
+export async function runOneShot(
+  deps: AgentDeps,
+  cfg: AgentConfig,
+  prompt: string,
+): Promise<AgentResult>;
+
+export async function runInteractive(
+  deps: AgentDeps,
+  cfg: AgentConfig,
+): Promise<void>;
+
+// ============================================================
+// src/agent/logging.ts
+// ============================================================
+
+export interface AgentLogger {
+  info(line: string, meta?: Record<string, unknown>): void;
+  warn(line: string, meta?: Record<string, unknown>): void;
+  error(line: string, meta?: Record<string, unknown>): void;
+  debug(line: string, meta?: Record<string, unknown>): void;  // only when verbose || logFile
+  close(): Promise<void>;
+}
+
+export function createAgentLogger(cfg: AgentConfig): AgentLogger;
+
+// ============================================================
+// src/agent/system-prompt.ts
+// ============================================================
+
+export const DEFAULT_SYSTEM_PROMPT_TEMPLATE: string;
+export const MUTATIONS_DISABLED_CLAUSE: string;
+export const MUTATIONS_ENABLED_CLAUSE: string;
+
+export function renderSystemPrompt(
+  cfg: AgentConfig,
+  override?: string,
+): string;
+```
+
+Every field above maps directly to the FR-8 envelope; coders serialize
+`AgentResult` with `JSON.stringify(result, null, 2)` and the output
+already satisfies the spec.
+
+## 4. Configuration Surface
+
+Canonical, de-duplicated, precedence-normalized env-var table. Any
+inconsistency between the refined request, the investigation, and the
+research doc has been resolved here (see ADR-7 for DeepSeek variant
+handling; the `OUTLOOK_AGENT_AZURE_AI_INFERENCE_API_VERSION` row is
+explicitly flagged "informational — not passed to constructor" per
+investigation §3 note 3).
+
+| Env var | CLI flag | Required by | Purpose | Default (NONE = required) |
+|---|---|---|---|---|
+| `OUTLOOK_AGENT_PROVIDER` | `--provider`, `-p` | agent core (always) | Selects the LLM provider factory | NONE |
+| `OUTLOOK_AGENT_MODEL` | `--model`, `-m` | openai, anthropic, google, azure-deepseek (custom), azure-anthropic (custom) | Model id / deployment name | NONE (unless a provider-specific model env var is set, see below) |
+| `OUTLOOK_AGENT_MAX_STEPS` | `--max-steps` | agent core (optional) | ReAct iteration ceiling; 1..50 | `10` |
+| `OUTLOOK_AGENT_TEMPERATURE` | `--temperature` | agent core (optional) | Sampling temperature | `0` |
+| `OUTLOOK_AGENT_SYSTEM_PROMPT` | `--system` | agent core (optional) | Inline system prompt override | built-in (§11) |
+| `OUTLOOK_AGENT_SYSTEM_PROMPT_FILE` | `--system-file` | agent core (optional) | File-backed system prompt | none |
+| `OUTLOOK_AGENT_TOOLS` | `--tools` | agent core (optional) | CSV allowlist of tool names | full permitted set |
+| `OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES` | `--per-tool-budget` | tool adapters | Per-tool result byte budget | `16384` |
+| `OUTLOOK_AGENT_ALLOW_MUTATIONS` | `--allow-mutations` | tool catalog | Enables `create_folder`, `move_mail`, `download_attachments` | `false` |
+| `OUTLOOK_AGENT_OPENAI_API_KEY` | — | openai | OpenAI secret key | NONE |
+| `OUTLOOK_AGENT_OPENAI_BASE_URL` | — | openai (optional) | Gateway override | OpenAI default |
+| `OUTLOOK_AGENT_OPENAI_ORG` | — | openai (optional) | Organization id | none |
+| `OUTLOOK_AGENT_ANTHROPIC_API_KEY` | — | anthropic | Anthropic secret key | NONE |
+| `OUTLOOK_AGENT_ANTHROPIC_BASE_URL` | — | anthropic (optional) | Gateway override | Anthropic default |
+| `OUTLOOK_AGENT_GOOGLE_API_KEY` | — | google | Gemini API key | NONE |
+| `OUTLOOK_AGENT_AZURE_OPENAI_API_KEY` | — | azure-openai | Azure OpenAI secret key | NONE |
+| `OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT` | — | azure-openai | Resource endpoint URL (full, e.g. `https://my-res.openai.azure.com`) | NONE |
+| `OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION` | — | azure-openai | API version (e.g. `2024-10-21`) | NONE |
+| `OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT` | — | azure-openai | Deployment name | NONE |
+| `OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY` | — | azure-anthropic, azure-deepseek (shared) | Foundry resource key | NONE |
+| `OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT` | — | azure-anthropic, azure-deepseek (shared) | Foundry resource base URL. Factory strips trailing `/` and `/models`, then appends `/anthropic` (azure-anthropic) or `/openai/v1` (azure-deepseek). | NONE |
+| `OUTLOOK_AGENT_AZURE_AI_INFERENCE_API_VERSION` | — | — (informational only) | Retained for audit — **not passed to any constructor** per investigation §3 note 3. | none |
+| `OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL` | `--model` | azure-anthropic | Foundry deployment name for Anthropic model (e.g. `claude-sonnet-4-5`) | NONE (unless `--model`) |
+| `OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL` | `--model` | azure-deepseek | Foundry deployment name (e.g. `DeepSeek-V3.2`); rejected at config load if it matches §5.6 denylist | NONE (unless `--model`) |
+
+Precedence. For every row above: **CLI flag > process env > `.env`
+file > NO DEFAULT** for mandatory rows; for optional rows with a
+default, the default applies only after all three tiers are exhausted.
+This rule is enforced by `loadAgentConfig` via the same pattern
+`src/config/config.ts` uses for `OUTLOOK_CLI_*` vars — no new helper is
+added to `config.ts` (ADR-8).
+
+Dotenv call site. `loadDotenv(envFilePath)` is invoked at the TOP of
+`commands/agent.ts :: run(...)`, BEFORE `loadAgentConfig(opts)` runs.
+Semantics: `dotenv.config({ path: envFilePath ?? undefined, override:
+false })`. `override: false` is the default and guarantees the
+precedence rule — `.env` never overwrites values already present in
+`process.env`.
+
+`.env` file default path. When `--env-file`/`envFile` is not set,
+`loadDotenv(null)` calls `dotenv.config({ override: false })` with no
+`path` option, which defaults to `$(cwd)/.env` per dotenv's
+documented behavior. Missing default `.env` is a no-op (dotenv returns
+a parse error object that `loadDotenv` discards — files are a
+convenience, not a config setting).
+
+`--env-file` with missing file. `loadDotenv` MUST stat the path first;
+if `fs.existsSync(envFilePath) === false`, throw `ConfigurationError({
+missingSetting: 'envFile', checkedSources: [\`file:${envFilePath}\`],
+detail: 'File does not exist' })` → exit 3. This is NOT a fallback
+violation: the user EXPLICITLY asked for the file via the flag.
+
+## 5. LLM Provider Registry — Concrete Design
+
+Every provider factory is async (§3), reads ONLY the env vars declared
+in its row, and throws `ConfigurationError` on any missing required
+variable with the precedence-traced `checkedSources` array matching the
+existing `src/config/config.ts` convention. All six factories return a
+`BaseChatModel` that supports `.bindTools([...])` — `createAgent`/
+`createReactAgent` will call this internally.
+
+### 5.1 `openai`
+
+- Stable id: `openai`
+- Class: `ChatOpenAI` (npm `@langchain/openai`)
+- Constructor (interface-level):
+  ```typescript
+  new ChatOpenAI({
+    model: cfg.model!,                          // required; validated upstream
+    apiKey: env.OUTLOOK_AGENT_OPENAI_API_KEY,   // required
+    configuration: {
+      baseURL: env.OUTLOOK_AGENT_OPENAI_BASE_URL,   // optional
+      organization: env.OUTLOOK_AGENT_OPENAI_ORG,   // optional
+    },
+    temperature: cfg.temperature,
+  });
+  ```
+- Required env: `OUTLOOK_AGENT_OPENAI_API_KEY`
+- Optional env: `OUTLOOK_AGENT_OPENAI_BASE_URL`, `OUTLOOK_AGENT_OPENAI_ORG`
+- Tool binding: `createAgent({ tools })` calls `.bindTools()` internally; factory does NOT call it.
+- Quirks: `gpt-4o`+ supports parallel tool calls; older models do not. Streaming deferred (D9).
+
+### 5.2 `anthropic`
+
+- Stable id: `anthropic`
+- Class: `ChatAnthropic` (npm `@langchain/anthropic`)
+- Constructor:
+  ```typescript
+  new ChatAnthropic({
+    model: cfg.model!,                           // required
+    apiKey: env.OUTLOOK_AGENT_ANTHROPIC_API_KEY, // required
+    clientOptions: {
+      baseURL: env.OUTLOOK_AGENT_ANTHROPIC_BASE_URL,  // optional
+    },
+    temperature: cfg.temperature,
+  });
+  ```
+- Required env: `OUTLOOK_AGENT_ANTHROPIC_API_KEY`
+- Optional env: `OUTLOOK_AGENT_ANTHROPIC_BASE_URL`
+- Tool binding: via `createAgent({ tools })`.
+- Quirks: `anthropic-version` header managed by the SDK (2023-06-01). Extended thinking not used in v1.
+
+### 5.3 `google`
+
+- Stable id: `google`
+- Class: `ChatGoogleGenerativeAI` (npm `@langchain/google-genai`)
+- Constructor:
+  ```typescript
+  new ChatGoogleGenerativeAI({
+    model: cfg.model!,                          // e.g. 'gemini-2.5-pro'
+    apiKey: env.OUTLOOK_AGENT_GOOGLE_API_KEY,   // required
+    temperature: cfg.temperature,
+  });
+  ```
+- Required env: `OUTLOOK_AGENT_GOOGLE_API_KEY`
+- Optional env: none
+- Tool binding: via `createAgent({ tools })`.
+- Quirks: max-output varies by model; no `apiVersion`.
+
+### 5.4 `azure-openai`
+
+- Stable id: `azure-openai`
+- Class: `AzureChatOpenAI` (npm `@langchain/openai`)
+- Constructor:
+  ```typescript
+  new AzureChatOpenAI({
+    azureOpenAIApiKey: env.OUTLOOK_AGENT_AZURE_OPENAI_API_KEY,          // required
+    azureOpenAIEndpoint: env.OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT,       // required (full URL)
+    azureOpenAIApiVersion: env.OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION,  // required
+    azureOpenAIApiDeploymentName:
+      env.OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT,                        // required
+    temperature: cfg.temperature,
+  });
+  ```
+- Required env: all four listed above.
+- Tool binding: via `createAgent({ tools })`.
+- Quirks: `cfg.model` is **advisory only** — Azure OpenAI routes by deployment; the factory still stores `cfg.model ?? OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT` in `AgentResult.model` for observability.
+
+### 5.5 `azure-anthropic`
+
+- Stable id: `azure-anthropic`
+- Class: `ChatAnthropic` (npm `@langchain/anthropic`, with custom baseUrl)
+- Constructor:
+  ```typescript
+  const baseUrl = normalizeFoundryEndpoint(
+    env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT!,  // strip trailing / and /models
+  ) + '/anthropic';
+  new ChatAnthropic({
+    model: cfg.model ?? env.OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL!,
+    apiKey: env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY,
+    clientOptions: { baseURL: baseUrl },
+    temperature: cfg.temperature,
+  });
+  ```
+- Required env: `OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY`,
+  `OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT`,
+  `OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL` (unless `--model` given).
+- Optional env: `OUTLOOK_AGENT_AZURE_AI_INFERENCE_API_VERSION` (retained
+  for audit; NOT passed to constructor — ADR-7 / investigation §3 note 3).
+- Tool binding: via `createAgent({ tools })`.
+- Quirks: Foundry endpoint is wire-compatible with Anthropic Messages API.
+
+### 5.6 `azure-deepseek`
+
+- Stable id: `azure-deepseek`
+- Class: `ChatOpenAI` (npm `@langchain/openai`, NOT `AzureChatOpenAI`)
+- Constructor:
+  ```typescript
+  const baseURL = normalizeFoundryEndpoint(
+    env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT!,
+  ) + '/openai/v1';
+  new ChatOpenAI({
+    model: cfg.model ?? env.OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL!,
+    apiKey: env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY,
+    configuration: { baseURL },
+    temperature: cfg.temperature,
+    // Do NOT set: apiVersion, reasoning, extra_body.thinking
+  });
+  ```
+- Required env: `OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY`,
+  `OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT`,
+  `OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL` (unless `--model` given).
+- Optional env: `OUTLOOK_AGENT_AZURE_AI_INFERENCE_API_VERSION` (informational).
+- **Model-variant allowlist (enforced at config load, research §7.2–7.3)**:
+  - **Denylist (reject with `ConfigurationError`)**: regexes
+    `/deepseek-v3\.2-speciale/i`, `/deepseek-r1(?!-0528)/i`,
+    `/deepseek-r1-0528/i` (rejected due to `ChatOpenAI` parameter-injection
+    incompatibility), `/deepseek-reasoner/i`, `/mai-ds-r1/i`.
+    Error message names the model and tells the user to switch to a
+    V3.x variant.
+  - **Allowlist (accepted silently)**: names matching `/deepseek-v3(\.[12])?$/i`.
+  - **Custom names**: accepted with a `console.warn` to stderr
+    (suppressed when `cfg.quiet`).
+- Tool binding: via `createAgent({ tools })`.
+- Quirks: no `api-version` query param; model name must match the exact
+  deployment name from Azure portal.
+
+A shared helper `normalizeFoundryEndpoint(raw: string): string` lives
+inside the factory files (duplicated or extracted — coder choice) and
+strips trailing `/` and a trailing `/models` segment. Unit tests in
+`agent-provider-azure-anthropic.spec.ts` and
+`agent-provider-azure-deepseek.spec.ts` cover the four variants: no
+suffix, `/`, `/models`, `/models/`.
+
+## 6. Tool Adapter Contracts
+
+Every adapter is a `ToolAdapterFactory` — `(deps, cfg) =>
+StructuredTool`. Adapters capture `deps` and `cfg` in a closure (ADR-3)
+so they carry NO per-invocation state. The order of fields below
+corresponds to the Zod schemas shipped in v1 and mirrors the refined
+spec §8 shapes.
+
+Common rules:
+- `name` is snake_case.
+- `description` is ≤ 240 chars, LLM-facing, written as an imperative.
+- Every return value is serialized as JSON and passed through
+  `truncateToolResult(result, cfg.perToolBudgetBytes)`.
+- Recoverable errors (see plan §2 Phase D "Error handling contract")
+  become a JSON `{ error: { code, message } }` that the LLM sees as a
+  ToolMessage and may react to. Fatal errors (ConfigurationError,
+  AuthError with `reason: 'NO_AUTO_REAUTH'`, IoError outside
+  `download_attachments`) rethrow and propagate through `makeAction` to
+  the process exit code.
+- `toolsAllowlist` is applied after the mutation gate: if
+  `cfg.allowMutations === false`, mutation tools are **omitted from the
+  catalog entirely** (ADR-4). They are not registered-but-refused.
+
+### 6.1 `auth_check`
+
+- Description: "Verify the current Outlook session is accepted without opening a browser. Call before other tools if a call returns an auth error."
+- Zod schema: `z.object({})`
+- Delegates to: `authCheck.run(deps)` (no options)
+- Output: `{ status, tokenExpiresAt, account }` (the existing `AuthCheckResult` shape)
+- Errors: `UpstreamError` → recoverable ToolMessage JSON
+- Mutation: N
+
+### 6.2 `list_mail`
+
+- Description: "List recent messages in a folder (alias, path, or id), optionally filtered by a date window. Set justCount=true to return only a count."
+- Zod schema:
+  ```typescript
+  z.object({
+    top: z.number().int().min(1).max(1000).default(10),
+    folder: z.string().optional(),
+    folderId: z.string().optional(),
+    folderParent: z.string().optional(),
+    from: z.string().optional(),
+    to: z.string().optional(),
+    select: z.string().optional(),
+    justCount: z.boolean().default(false),
+  }).refine(v => !(v.folder && v.folderId),
+    { message: 'folder and folderId are mutually exclusive' });
+  ```
+- Delegates to: `listMail.run(deps, opts)`, mapping each input field to
+  the same-named `ListMailOptions` field (camelCase pass-through; no
+  key remapping needed).
+- Output: `MessageSummary[]` OR `{ count, exact }` when `justCount`.
+- Errors: `UsageError`/`FOLDER_*`/`UpstreamError`/`AuthError(AFTER_RETRY)`
+  → recoverable. `AuthError(NO_AUTO_REAUTH)` + flag set → fatal.
+- Mutation: N
+
+### 6.3 `get_mail`
+
+- Description: "Retrieve one email by id, including body and attachment metadata."
+- Zod schema:
+  ```typescript
+  z.object({
+    id: z.string().min(1),
+    body: z.enum(['html', 'text', 'none']).default('text'),
+  })
+  ```
+- Delegates to: `getMail.run(deps, id, { body })`.
+- Output: `Message & { Attachments: AttachmentSummary[] }` (attachment
+  bytes omitted — the existing command only returns metadata).
+- Errors: `UPSTREAM_MESSAGE_NOT_FOUND`, `UpstreamError`, `AuthError` → recoverable.
+- Mutation: N
+
+### 6.4 `get_thread`
+
+- Description: "Retrieve every message in the conversation thread that a message id belongs to."
+- Zod schema:
+  ```typescript
+  z.object({
+    id: z.string().min(1),   // message id or 'conv:<rawConvId>'
+    body: z.enum(['html', 'text', 'none']).default('text'),
+    order: z.enum(['asc', 'desc']).default('asc'),
+  })
+  ```
+- Delegates to: `getThread.run(deps, id, { body, order })`.
+- Output: `{ conversationId, count, messages }`.
+- Errors: same as `get_mail`.
+- Mutation: N
+
+### 6.5 `list_folders`
+
+- Description: "Enumerate mail folders under a parent (alias, path, or id). recursive=true walks the full tree."
+- Zod schema:
+  ```typescript
+  z.object({
+    parent: z.string().default('MsgFolderRoot'),
+    top: z.number().int().min(1).max(250).default(100),
+    recursive: z.boolean().default(false),
+    includeHidden: z.boolean().default(false),
+    firstMatch: z.boolean().default(false),
+  })
+  ```
+- Delegates to: `listFolders.run(deps, { parent, top, recursive, includeHidden, firstMatch })`.
+- Output: `FolderSummary[]` (with materialized `Path` when recursive).
+- Errors: `UPSTREAM_FOLDER_NOT_FOUND`, `FOLDER_AMBIGUOUS`,
+  `UPSTREAM_PAGINATION_LIMIT`, `AuthError` → recoverable.
+- Mutation: N
+
+### 6.6 `find_folder`
+
+- Description: "Resolve a folder query (alias, display-name path, or id:<raw>) to a single folder object."
+- Zod schema:
+  ```typescript
+  z.object({
+    spec: z.string().min(1),
+    anchor: z.string().default('MsgFolderRoot'),
+    firstMatch: z.boolean().default(false),
+  })
+  ```
+- Delegates to: `findFolder.run(deps, spec, { anchor, firstMatch })`.
+- Output: `ResolvedFolder`.
+- Errors: `UPSTREAM_FOLDER_NOT_FOUND`, `FOLDER_AMBIGUOUS`,
+  `FOLDER_PATH_INVALID` → recoverable.
+- Mutation: N
+
+### 6.7 `list_calendar`
+
+- Description: "List calendar events between a start and end datetime."
+- Zod schema:
+  ```typescript
+  z.object({
+    from: z.string().default('now'),
+    to: z.string().default('now + 7d'),
+    tz: z.string().optional(),
+  })
+  ```
+- Delegates to: `listCalendar.run(deps, { from, to, tz })`.
+- Output: `EventSummary[]`.
+- Errors: `UpstreamError`, `AuthError` → recoverable.
+- Mutation: N
+
+### 6.8 `get_event`
+
+- Description: "Retrieve a single calendar event by id."
+- Zod schema:
+  ```typescript
+  z.object({
+    id: z.string().min(1),
+    body: z.enum(['html', 'text', 'none']).default('text'),
+  })
+  ```
+- Delegates to: `getEvent.run(deps, id, { body })`.
+- Output: `Event`.
+- Errors: `UPSTREAM_EVENT_NOT_FOUND`, `AuthError` → recoverable.
+- Mutation: N
+
+### 6.9 `create_folder`  *(mutation — gated)*
+
+- Description: "Create a folder (optionally nested). Idempotent by default."
+- Zod schema:
+  ```typescript
+  z.object({
+    pathOrName: z.string().min(1),
+    parent: z.string().default('MsgFolderRoot'),
+    createParents: z.boolean().default(false),
+    idempotent: z.boolean().default(true),   // NB: agent default differs from CLI (ADR-4 and codebase-scan §12)
+  })
+  ```
+- Delegates to: `createFolder.run(deps, pathOrName, { parent, createParents, idempotent })`.
+- Output: `CreateFolderResult`.
+- Errors: `FOLDER_PATH_INVALID`, `FOLDER_MISSING_PARENT`,
+  `FOLDER_ALREADY_EXISTS` (only when `idempotent: false`) → recoverable.
+- Mutation: **Y** — omitted from catalog when `cfg.allowMutations === false`.
+
+### 6.10 `move_mail`  *(mutation — gated)*
+
+- Description: "Move messages to a destination folder. Returns NEW ids (source ids become invalid)."
+- Zod schema:
+  ```typescript
+  z.object({
+    messageIds: z.array(z.string().min(1)).min(1).max(50),
+    to: z.string().min(1),
+    firstMatch: z.boolean().default(false),
+    continueOnError: z.boolean().default(true),
+  })
+  ```
+- Delegates to: `moveMail.run(deps, messageIds, { to, firstMatch, continueOnError })`.
+- Output: `MoveMailResult` (`destination`, `moved[]`, `failed[]`, `summary`).
+- Errors: `UPSTREAM_FOLDER_NOT_FOUND`, `FOLDER_AMBIGUOUS`,
+  `UPSTREAM_MESSAGE_NOT_FOUND`, partial-failure summary → recoverable.
+- Mutation: **Y** — omitted from catalog when `cfg.allowMutations === false`.
+
+### 6.11 `download_attachments`  *(mutation — gated)*
+
+- Description: "Download file attachments of a message to a local directory. Byte content is never returned."
+- Zod schema:
+  ```typescript
+  z.object({
+    messageId: z.string().min(1),
+    outDir: z.string().min(1),
+    overwrite: z.boolean().default(false),
+    includeInline: z.boolean().default(false),
+  })
+  ```
+- Delegates to: `downloadAttachments.run(deps, messageId, { outDir, overwrite, includeInline })`.
+- Output: `{ messageId, outDir, saved, skipped }` — byte content is explicitly NOT returned.
+- Errors: `UPSTREAM_MESSAGE_NOT_FOUND`, `AuthError` → recoverable.
+  IoError (filesystem) is surfaced to the LLM as a recoverable
+  ToolMessage error (so it can suggest a different `outDir`) **except**
+  for path-traversal violations (`assertWithinDir` throws) and EACCES on
+  `outDir`, which remain fatal per refined §8.11.
+- Mutation: **Y** — omitted from catalog when `cfg.allowMutations === false`.
+
+## 7. ReAct Loop Contract
+
+Library entry point. `createAgent` from `langchain` v1 is the primary
+path (ADR-1, investigation D1). `src/agent/graph.ts` is the SOLE file
+importing `createAgent`. If `createAgent` fails to compile or runtime-load
+(investigation Risk 2), swap the import to `createReactAgent` from
+`@langchain/langgraph/prebuilt` and pass `{ llm: model, tools,
+stateModifier: systemPrompt, checkpointSaver: checkpointer }` — the
+surrounding code does not change.
+
+State carried by the graph. LangGraph's built-in `messages` channel
+carries the `BaseMessage[]` transcript (System + Human + AI + Tool).
+Our code tracks these externally:
+- `stepCount: number` — incremented for each AIMessage with `tool_calls`
+  (derived from `messages` post-invoke; NOT a graph channel).
+- `usage: AgentUsage | null` — accumulated from `AIMessage.usage_metadata`
+  when the provider emits it; `null` when no step emitted usage.
+- `toolResults: AgentStep[]` — stitched from consecutive `AIMessage`
+  (with `tool_calls`) + `ToolMessage` (with `tool_call_id`) pairs after
+  `.invoke()` resolves. Not fed back to the LLM (LangGraph's built-in
+  ToolNode already did that).
+- `terminatedBy: 'final-answer' | 'maxSteps' | 'wallClock' | 'sigint' | 'error'`
+  — determined by which branch of the termination check fires.
+
+Termination rules (precedence order, evaluated after `.invoke()` returns
+or throws):
+1. SIGINT during invoke → `AbortController.signal` aborts the graph;
+   runner catches `AbortError`, sets `terminatedBy: 'sigint'`; one-shot
+   exits 130; interactive keeps REPL alive.
+2. `GraphRecursionError` from LangGraph (our `cfg.maxSteps` translated to
+   `recursionLimit`) → runner catches it, sets `terminatedBy:
+   'maxSteps'`, `truncated: true`, returns with the last extracted
+   AIMessage content (or `null` if none), exit 0.
+3. Wall-clock budget (see §14 — default 5 min for one-shot, unlimited
+   for interactive turn) → `AbortController` fires, same path as SIGINT
+   but `terminatedBy: 'wallClock'`, exit 5 (upstream timeout class).
+4. `.invoke()` resolves with a final AIMessage that has no `tool_calls`
+   → `terminatedBy: 'final-answer'`, `answer = last AIMessage.content`,
+   exit 0.
+5. Any other exception → `terminatedBy: 'error'`, envelope emitted with
+   `answer: null`, exit code via `exitCodeFor(err)`.
+
+Error propagation into the loop vs. aborts. Tool adapter errors follow
+§6 (recoverable vs. fatal). Recoverable errors become ToolMessages and
+are counted toward `maxSteps`. Fatal errors bubble out of `.invoke()`
+and are caught by `runOneShot`/`runInteractive`; the envelope is still
+emitted for one-shot (with `answer: null`, `steps[]` accumulated so
+far, `meta.terminatedBy: 'error'`) before `makeAction`'s own `catch`
+maps them to the exit code.
+
+Interactive mode. `MemorySaver` is instantiated once per REPL session.
+`thread_id = \`outlook-agent-${process.pid}-${Date.now()}\`` so logs can
+tie turns together. Slash commands (`/exit`, `/clear`, `/tools`,
+`/system`, `/help`) are handled locally in `runInteractive` before any
+LLM call. `/clear` discards the `MemorySaver` and generates a fresh
+`thread_id`. `/system <text>` replaces `cfg.systemPrompt` and rebuilds
+the graph (providers and tools are reused). History persists for the
+life of the process only (D2). No on-disk thread store in v1.
+
+Per-run identity. `cfg.runId = crypto.randomUUID()` is generated in
+`loadAgentConfig` and threaded into every log record and every
+`AgentResult`. In interactive mode, the same runId persists across
+turns (it identifies the REPL session); each `invoke()` call's
+`thread_id` is the runId.
+
+## 8. JSON Output Envelope
+
+Exact shape emitted when `--json` is active (the default unless
+`--table` is explicit on a TTY). Field order is stable. `steps[]` is
+1-indexed. `args` and `result` are the POST-redaction, POST-truncation
+payloads — identical to what the LLM observed.
+
+```json
+{
+  "answer": "Your three most recent unread inbox messages are: 1) \"Q3 kickoff\" from Alice (Id=AAMkAGI...a), 2) \"Status update\" from Bob (Id=AAMkAGI...b), 3) \"Design review\" from Carol (Id=AAMkAGI...c).",
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "prompt": "list my 3 most recent unread emails",
+  "steps": [
+    {
+      "index": 1,
+      "tool": "list_mail",
+      "args": { "top": 3, "folder": "Inbox" },
+      "result": [
+        { "Id": "AAMkAGI...a", "Subject": "Q3 kickoff", "From": { "EmailAddress": { "Name": "Alice", "Address": "alice@example.com" } }, "ReceivedDateTime": "2026-04-22T09:12:03Z", "IsRead": false },
+        { "Id": "AAMkAGI...b", "Subject": "Status update", "From": { "EmailAddress": { "Name": "Bob", "Address": "bob@example.com" } }, "ReceivedDateTime": "2026-04-22T08:41:58Z", "IsRead": false },
+        { "Id": "AAMkAGI...c", "Subject": "Design review", "From": { "EmailAddress": { "Name": "Carol", "Address": "carol@example.com" } }, "ReceivedDateTime": "2026-04-22T07:15:22Z", "IsRead": false }
+      ],
+      "durationMs": 843
+    },
+    {
+      "index": 2,
+      "tool": "get_mail",
+      "args": { "id": "AAMkAGI...a", "body": "text" },
+      "result": { "Id": "AAMkAGI...a", "Subject": "Q3 kickoff", "BodyPreview": "Hi team — kicking off Q3 planning this Friday...", "Attachments": [] },
+      "durationMs": 412
+    }
+  ],
+  "usage": {
+    "promptTokens": 1234,
+    "completionTokens": 456,
+    "totalTokens": 1690
+  },
+  "meta": {
+    "maxSteps": 10,
+    "stepsUsed": 2,
+    "durationMs": 3987,
+    "terminatedBy": "final-answer",
+    "runId": "f9f8e0a0-7f9a-4c1b-9a33-0d1b0a8b6f55",
+    "truncated": false
+  }
+}
+```
+
+Optionality:
+- `answer` — `string | null`. Null only when `meta.terminatedBy` is
+  `"maxSteps"`, `"wallClock"`, `"sigint"`, or `"error"` and the last
+  AIMessage carried no content.
+- `usage` — `AgentUsage | null`. Null when no step emitted
+  `usage_metadata`.
+- `steps[].tool` — optional; absent for pure reasoning steps (AIMessage
+  without tool_calls that isn't the final answer — e.g., streaming
+  artifacts in future).
+- `steps[].args` / `steps[].result` — present iff `tool` is present.
+- `steps[].error` — present iff the tool adapter returned a recoverable
+  error ToolMessage; `result` is still populated with the error JSON so
+  no information is lost.
+- `steps[].reasoning` — present iff the preceding AIMessage had
+  non-empty `content` alongside `tool_calls`.
+
+`--table` output (§8 continuation). Human-friendly fallback. Stdout
+receives the wrapped `answer` (or the string `(no final answer —
+terminatedBy=<reason>)` when null), followed by the step summary table:
+
+| Column | Source |
+|---|---|
+| `#` | `steps[].index` |
+| `Tool` | `steps[].tool ?? "-"` |
+| `Status` | `steps[].error ? "ERROR" : "OK"` |
+| `DurationMs` | `steps[].durationMs` |
+
+`AGENT_TABLE_COLUMNS: ColumnSpec<AgentStep>[]` is defined in
+`src/cli.ts` (Phase H) and passed to `emitResult`.
+
+## 9. Error & Exit-Code Mapping
+
+The agent introduces NO new exit codes (ADR-8 rationale). Every new
+error class either reuses an existing class from `src/config/errors.ts`
+or sets its `code` such that `exitCodeFor` maps it to the right exit.
+
+| Error class / condition | Raised by | Maps to exit |
+|---|---|---|
+| `ConfigurationError{missingSetting: 'providerName'}` | `loadAgentConfig` | 3 |
+| `ConfigurationError{missingSetting: 'OUTLOOK_AGENT_OPENAI_API_KEY'}` (and every other provider-required var) | provider factory | 3 |
+| `ConfigurationError{missingSetting: 'envFile'}` | `loadDotenv` | 3 |
+| `ConfigurationError{missingSetting: 'systemPromptFile'}` (unreadable file) | `loadAgentConfig` | 3 |
+| `ConfigurationError{missingSetting: 'OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL', detail: '…'}` (denylist match) | `azure-deepseek` factory | 3 |
+| `UsageError` (invalid `--max-steps`, mutual exclusion, unknown provider name, unknown tool name in `--tools`) | `loadAgentConfig`, `getProvider` | 2 |
+| `AuthError` (`auth-check != 'ok'` + `--no-auto-reauth`) | `agentCmd.run` | 4 |
+| `AuthError` from a tool adapter with `--no-auto-reauth` set | tool adapter (fatal branch) | 4 |
+| Provider SDK 4xx/5xx during `.invoke()` | wrapped in `UpstreamError` by `runOneShot`/`runInteractive` catch | 5 |
+| Tool adapter runtime bug (unexpected throw, Zod failure on OUTPUT) | wrapped in `OutlookCliError` | 1 |
+| Step-limit reached without a final AIMessage | runner sets `meta.terminatedBy: 'maxSteps'`, `truncated: true`; envelope emitted normally | **0** (not an error — per FR-13) |
+| Wall-clock budget exceeded | wrapped in `UpstreamError{code: 'UPSTREAM_TIMEOUT'}` | 5 |
+| IoError writing `--log-file` | `createAgentLogger` | 6 |
+| SIGINT in interactive mode (idle prompt) | `runInteractive` | 130 |
+| SIGINT during a running turn | `runInteractive` catches `AbortError`, keeps REPL alive | — (no exit) |
+| SIGINT in one-shot mode | `runOneShot` catches `AbortError`, envelope emitted with `terminatedBy: 'sigint'`, `answer: null` | 130 |
+
+All error classes (`ConfigurationError`, `UsageError`, `AuthError`,
+`UpstreamError`, `IoError`, `OutlookCliError`) come from existing
+`src/config/errors.ts`; the agent does NOT add new classes.
+
+## 10. Logging & Redaction
+
+`createAgentLogger(cfg)` is the single log sink for the agent. It
+respects `cfg.quiet` and `cfg.logFilePath`:
+
+| Condition | stderr | log file |
+|---|---|---|
+| `cfg.quiet && !cfg.logFilePath` | suppressed | — |
+| `cfg.quiet && cfg.logFilePath` | suppressed | written (mode 0600) |
+| `!cfg.quiet && !cfg.logFilePath` | written | — |
+| `!cfg.quiet && cfg.logFilePath` | written | written |
+| `cfg.verbose` (any) | includes DEBUG lines (per-step thinking + tool call + tool result, tool result body truncated to `cfg.perToolBudgetBytes`) | includes DEBUG lines |
+
+Every string argument and every string value inside `meta` is passed
+through `redactString` from `src/util/redact.ts` BEFORE any sink
+writes. JSON-lines format (one record per line) with fields:
+`{ ts, level, runId, message, ...meta }`.
+
+Log file opening: `fs.promises.open(path, 'a', 0o600)` on first write.
+A Node `EACCES` / `ENOENT` / `EISDIR` surfaces as
+`IoError{code: 'IO_LOG_WRITE_FAILED'}` → exit 6.
+
+## 11. Default System Prompt
+
+Coders copy this block verbatim into `src/agent/system-prompt.ts`. The
+`{mutationsEnabled}` token is replaced at runtime by `renderSystemPrompt`
+with the corresponding clause.
+
+```
+You are an Outlook assistant embedded in the outlook-cli tool. You have access to tools that read the user's Outlook mailbox, calendar, and folder tree. Your job is to answer questions and fulfill tasks by calling these tools and reporting what you observe.
+
+TOOL USE RULES:
+- Always use tools to retrieve information. Never invent message content, sender names, email addresses, timestamps, subject lines, folder names, or event details. If you do not know something, call a tool to find out.
+- Prefer the smallest, most specific tool call. If you only need one email, do not list 100. If you need to locate a folder, use find_folder before list_folders.
+- Always cite the exact Id field (message Id, event Id, folder Id) when you reference a specific item in your reply. The user may need it for follow-up actions.
+- If a tool returns an error, report the error to the user clearly. Do not retry the same failing call more than once without changing the input parameters.
+- Respect the --max-steps budget. If you are close to the limit, summarize what you have found rather than making more tool calls.
+
+SENSITIVE DATA:
+- Do not repeat raw email body content verbatim unless the user explicitly asks for the full text. Summarize instead.
+- Do not include API keys, authentication tokens, passwords, or other credentials in your replies, even if they appear in tool outputs (they should not, but treat them as confidential if they do).
+
+MUTATION OPERATIONS:
+{mutationsEnabled}
+
+When in doubt, ask a clarifying question rather than taking an irreversible action.
+```
+
+`MUTATIONS_DISABLED_CLAUSE` (substituted when `cfg.allowMutations ===
+false`):
+
+```
+The tools create_folder, move_mail, and download_attachments are NOT available in this session. If the user asks you to create a folder, move messages, or download attachments, inform them that they need to re-run with --allow-mutations to enable these operations.
+```
+
+`MUTATIONS_ENABLED_CLAUSE` (substituted when `cfg.allowMutations ===
+true`):
+
+```
+The tools create_folder, move_mail, and download_attachments are ENABLED. Before executing any of these tools, confirm the intended action with the user in plain language: state exactly what will be created, moved, or downloaded, and ask for explicit confirmation. Do not execute a mutating tool based on an ambiguous or overly broad instruction.
+```
+
+Note: this design's `MUTATIONS_DISABLED_CLAUSE` wording differs from
+the investigation's §5 text (which still said mutation tools are "in
+the catalog but disabled"). The plan (Phase D) OMITS mutation tools
+from the catalog entirely when `--allow-mutations` is absent, so the
+prompt must reflect that — otherwise the LLM may hallucinate
+tool-use attempts and waste steps. This reconciliation is the final
+authoritative wording.
+
+## 12. Parallel Implementation Units
+
+Plan phases A..J map to six implementation units. Exactly ONE unit
+owns each file; no unit crosses file boundaries with another.
+
+### Unit 1 — Dependencies & hygiene *(maps to Phase A)*
+- **Owned files**: `package.json`, `package-lock.json`, `.gitignore`,
+  `.env.example`.
+- **Depends on**: none.
+- **Must satisfy**: package manifest in plan §Phase A; CJS smoke test
+  in plan §Phase A acceptance criteria.
+- **Interface contracts**: none (no source code).
+- **Sequencing**: runs FIRST, serially. Units 2–5 cannot start until
+  Unit 1 lands.
+
+### Unit 2 — Agent config loader *(maps to Phase B)*
+- **Owned files**:
+  - `src/config/agent-config.ts`
+  - `test_scripts/agent-config.spec.ts`
+- **Depends on**: Unit 1.
+- **Must satisfy**: §3 interfaces `ProviderName`, `AgentConfig`,
+  `AgentCliFlags`, `loadAgentConfig`, `loadDotenv`. §4 precedence rule.
+  §9 exit-code mapping for `ConfigurationError{'providerName'|'envFile'|
+  'systemPromptFile'}` and `UsageError`.
+- **Parallelizable with**: Units 3, 4, 5.
+
+### Unit 3 — LLM provider registry *(maps to Phase C)*
+- **Owned files**:
+  - `src/agent/providers/openai.ts`
+  - `src/agent/providers/anthropic.ts`
+  - `src/agent/providers/google.ts`
+  - `src/agent/providers/azure-openai.ts`
+  - `src/agent/providers/azure-anthropic.ts`
+  - `src/agent/providers/azure-deepseek.ts`
+  - `src/agent/providers/registry.ts`
+  - `test_scripts/agent-provider-registry.spec.ts`
+  - `test_scripts/agent-provider-openai.spec.ts`
+  - `test_scripts/agent-provider-anthropic.spec.ts`
+  - `test_scripts/agent-provider-google.spec.ts`
+  - `test_scripts/agent-provider-azure-openai.spec.ts`
+  - `test_scripts/agent-provider-azure-anthropic.spec.ts`
+  - `test_scripts/agent-provider-azure-deepseek.spec.ts`
+- **Depends on**: Unit 1. (Type-imports `AgentConfig` from Unit 2 —
+  this is compile-only; runtime independence is total.)
+- **Must satisfy**: §3 interfaces `ProviderFactory`, `ProviderRegistry`,
+  `PROVIDERS`, `getProvider`. §5 per-provider constructor table. §5.6
+  DeepSeek denylist.
+- **Parallelizable with**: Units 2, 4, 5.
+
+### Unit 4 — Tool adapters *(maps to Phase D)*
+- **Owned files**:
+  - `src/agent/tools/auth-check-tool.ts`
+  - `src/agent/tools/list-mail-tool.ts`
+  - `src/agent/tools/get-mail-tool.ts`
+  - `src/agent/tools/get-thread-tool.ts`
+  - `src/agent/tools/list-folders-tool.ts`
+  - `src/agent/tools/find-folder-tool.ts`
+  - `src/agent/tools/list-calendar-tool.ts`
+  - `src/agent/tools/get-event-tool.ts`
+  - `src/agent/tools/create-folder-tool.ts`
+  - `src/agent/tools/move-mail-tool.ts`
+  - `src/agent/tools/download-attachments-tool.ts`
+  - `src/agent/tools/truncate.ts`
+  - `src/agent/tools/registry.ts`
+  - `test_scripts/agent-tools.spec.ts`
+  - `test_scripts/agent-tool-truncate.spec.ts`
+- **Depends on**: Unit 1. (Type-imports `AgentConfig` and `AgentDeps`
+  from Units 2 and 6 — compile-only.)
+- **Must satisfy**: §3 interfaces `ToolAdapterFactory`,
+  `buildToolCatalog`. §6 per-adapter contracts (name, description,
+  schema, mapping, output, error handling, mutation gate).
+- **Parallelizable with**: Units 2, 3, 5.
+
+### Unit 5 — ReAct core + logging + system prompt *(maps to Phases E + F)*
+- **Owned files**:
+  - `src/agent/logging.ts`
+  - `src/agent/graph.ts`
+  - `src/agent/run.ts`
+  - `src/agent/result.ts`
+  - `src/agent/system-prompt.ts`
+  - `test_scripts/agent-redact.spec.ts`
+  - `test_scripts/agent-graph.spec.ts`
+  - `test_scripts/agent-run-oneshot.spec.ts`
+  - `test_scripts/agent-run-interactive.spec.ts`
+- **Depends on**: Unit 1 at runtime; Units 2, 3, 4 at type-import.
+  (Unit 5's modules import `AgentConfig` from Unit 2, `getProvider`
+  from Unit 3, and `buildToolCatalog` from Unit 4 — all compile-only,
+  no execution dependency during unit tests thanks to `vi.mock`.)
+- **Must satisfy**: §3 interfaces `AgentResult`, `AgentStep`,
+  `AgentUsage`, `AgentMeta`, `AgentLogger`, `createAgentLogger`,
+  `BuildGraphOpts`, `createAgentGraph`, `CompiledGraph`, `runOneShot`,
+  `runInteractive`, `DEFAULT_SYSTEM_PROMPT_TEMPLATE`, `renderSystemPrompt`.
+  §7 termination rules. §8 envelope shape. §10 redaction + log modes.
+  §11 system prompt verbatim.
+- **Parallelizable with**: Units 2, 3, 4.
+
+### Unit 6 — Command wiring & docs *(maps to Phases G + H + I)*
+- **Owned files**:
+  - `src/commands/agent.ts`
+  - `src/cli.ts` **[MODIFY]** — ONLY Unit 6 edits this file.
+  - `test_scripts/commands-agent.spec.ts`
+  - `test_scripts/agent-acceptance.spec.ts`
+  - `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/CLAUDE.md` **[MODIFY]**
+  - `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/configuration-guide.md` **[MODIFY]**
+  - `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/project-functions.MD` **[MODIFY]** (only if not already populated by planner)
+  - `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/README.md` **[MODIFY]**
+  - `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/Issues - Pending Items.md` **[MODIFY]**
+- **Depends on**: Units 2, 3, 4, 5.
+- **Must satisfy**: §3 interfaces `AgentDeps`, `AgentOptions`,
+  `run(deps, prompt, opts)`. §8 `--table` column spec
+  (`AGENT_TABLE_COLUMNS`). §9 full exit-code mapping on the commander
+  action path.
+- **Sequencing**: runs LAST, serially. Its edits to `src/cli.ts`
+  cannot race other units because no other unit touches that file.
+
+Execution order:
+`Unit 1` → (`Unit 2` ∥ `Unit 3` ∥ `Unit 4` ∥ `Unit 5`) → `Unit 6` → Phase J gate.
+
+## 13. Architectural Decisions Record (ADR)
+
+- **ADR-1: ReAct engine = `createAgent` from `langchain` v1.**
+  Rationale: `createReactAgent` from `@langchain/langgraph/prebuilt` is
+  soft-deprecated as of LangGraph v1 (Oct 2025); `createAgent` is the
+  forward-looking entry point and ships the middleware hooks we'll need
+  for v2 (human-in-the-loop, PII redaction). Both compile; the
+  swap-to-prebuilt path is a one-file edit in `src/agent/graph.ts`
+  (Risk 2 mitigation).
+
+- **ADR-2: Provider registry is an object map keyed by `ProviderName`.**
+  Rationale: pluggability — adding a seventh provider is a single new
+  factory file + one entry in `PROVIDERS` + a test spec. Testability —
+  each factory is independently `vi.mock`-able. No visitor pattern, no
+  class hierarchy, no dynamic import — these would buy nothing at six
+  providers and would complicate CJS/ESM interop (Risk 1).
+
+- **ADR-3: Tool adapters hold a closure over `AgentDeps` rather than
+  receiving `deps` per-invocation.** Rationale: LangGraph passes tool
+  input to the adapter function at call time, but `deps` (Outlook
+  client, session plumbing, config) is fixed for the life of a run.
+  Capturing it in a closure (the factory signature) keeps the
+  tool-call hot path free of deps threading and matches LangChain's
+  `tool(fn, meta)` contract natively. The adapters become pure
+  input-to-output functions from the LLM's perspective.
+
+- **ADR-4: Mutation tools are EXCLUDED from the catalog unless
+  `--allow-mutations` is set.** Rationale: this is stricter than the
+  investigation's D4 (which registered them and refused at runtime).
+  Reasons for the stricter stance: (a) NFR-8's "closed-set tool
+  registry" principle — the LLM should not know about tools it cannot
+  invoke, because a prompt-injection email body could trick it into
+  attempting one; (b) omission eliminates an entire step-waste pattern
+  where the LLM repeatedly tries a disabled tool; (c) the system
+  prompt already tells the LLM about the mode, so the UX is
+  equivalent. `create_folder`'s agent default of `idempotent: true`
+  (diverging from the CLI default of `false`) is kept because D5
+  locked it in and it reduces LLM retry confusion on an already-gated
+  operation.
+
+- **ADR-5: `.env` is loaded INSIDE `commands/agent.ts` (not in
+  `makeAction`).** Rationale: scope — only the agent subcommand needs
+  `.env` support; every other subcommand continues to read
+  `process.env` only. Loading dotenv inside the agent command keeps
+  `cli.ts` thin, leaves other commands unaffected, and makes the call
+  order (`dotenv → loadAgentConfig`) unit-testable via `vi.mock('dotenv')`.
+  A global dotenv in `cli.ts` would silently change every other
+  subcommand's config resolution and violate the existing strict
+  no-fallback rule for `OUTLOOK_CLI_*` vars.
+
+- **ADR-6: Conversation memory is in-process only (MemorySaver).**
+  Rationale: simplicity in v1. On-disk thread stores (SQLite, Redis)
+  introduce schema migrations, file-locking against concurrent REPLs,
+  and a secret-at-rest concern. The refined spec (D2) locked this;
+  v2 can add a `--thread-id` flag backed by SQLite.
+
+- **ADR-7: DeepSeek R1 family and V3.2-Speciale rejected at config
+  time.** Rationale: authoritative Microsoft Learn docs confirm R1
+  original does not support tool calling; V3.2-Speciale omits tool
+  calling by design; R1-0528 technically added tool calling but
+  LangChain.js's `ChatOpenAI` injects `presence_penalty` / `temperature`
+  / `top_p` defaults that R1-family models reject with 400 (research
+  §5, GitHub langchainjs #7564). Rejecting at config load produces a
+  clear exit-3 ConfigurationError naming the model and pointing at a
+  supported V3.x variant; accepting and failing at first tool call
+  would silently burn `--max-steps` and a user's API credit. Per
+  CLAUDE.md global rule, no fallback to a "no-tools mode" is built —
+  the factory throws.
+
+- **ADR-8: No `resolveRequiredString` helper is added to
+  `src/config/config.ts`; `agent-config.ts` implements its own
+  resolution.** Rationale: keep `config.ts`'s public surface small.
+  The CLI config domain (`OUTLOOK_CLI_*`) and the agent config domain
+  (`OUTLOOK_AGENT_*`) are separate; co-locating the mandatory-value
+  resolver with the agent config file keeps the blast radius of agent
+  changes contained and avoids growing the existing loader's API.
+
+Additional ADRs specific to this design:
+
+- **ADR-9: `.env` loader does NOT throw on missing default file but DOES
+  throw on missing `--env-file`.** Rationale: the presence of a default
+  `.env` is a convenience, never contractual. When the user explicitly
+  passes `--env-file <path>`, they've made it contractual; a silent
+  no-op would violate expectations and hide typos.
+
+- **ADR-10: `AgentResult.answer` may be null.** Rationale: when the
+  step-limit is hit without a final AIMessage, forcing a synthetic
+  string is misleading. `null` + `meta.terminatedBy` is an
+  unambiguous signal for callers.
+
+- **ADR-11: Wall-clock budget is enforced INSIDE the runners, not in
+  individual tools.** Rationale: per-tool `--timeout` already exists at
+  the HTTP client layer and covers tool-level stalls. A separate
+  run-level budget catches pathological LLM loops that spam cheap
+  tools. Default 5 min for one-shot, disabled for interactive (see
+  §14).
+
+## 14. Non-Functional Requirements Restated
+
+- **Secrets never logged.** Every log line flows through `redactString`
+  (§10). Provider API keys are passed to constructors by reference;
+  they never touch the logger. `vi.spyOn` sweeps in
+  `agent-redact.spec.ts` assert zero matches for injected keys.
+
+- **`.env` is never written by the agent.** `loadDotenv` only calls
+  `dotenv.config(...)` (read-only). The agent has no code path that
+  writes to `.env` or any file matching `.env*`.
+
+- **Per-run wall-clock budget.** Default: one-shot 5 minutes
+  (300 000 ms); interactive: unlimited per turn (REPL users control
+  cancellation via Ctrl-C). Override: `OUTLOOK_AGENT_WALL_CLOCK_MS` env
+  var (optional, no CLI flag in v1) — when set, applies to both modes.
+  Enforced via `AbortController.signal` passed into LangGraph's
+  `.invoke(state, { signal, recursionLimit })`. On timeout,
+  `meta.terminatedBy: 'wallClock'`, exit 5, envelope still emitted.
+
+- **Deterministic mode for tests.** `cfg.temperature` default is `0`.
+  Unit tests instantiate `FakeListChatModel` or
+  `FakeMessagesListChatModel` from `@langchain/core/utils/testing`
+  (falling back to a local `ScriptedChatModel` double under
+  `test_scripts/_helpers/` if the entry-point proves unavailable at
+  Phase C start — plan §7).
+
+- **CJS-compatible only.** `package.json`'s `"type": "commonjs"` is
+  preserved. Phase A's smoke test (`node -e "require('@langchain/
+  langgraph');"`) is the gate; if any package refuses `require()`, the
+  fallback is dynamic `import()` isolated to `src/agent/graph.ts` and
+  `src/agent/providers/*.ts` (plan §5 Risk 1).
+
+Absolute output path: `/Users/giorgosmarinos/aiwork/coding-platform/outlook-tool/docs/design/project-design.md`
+

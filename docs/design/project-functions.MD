@@ -41,23 +41,34 @@ are informational, not errors), `3` missing mandatory config, `5` upstream error
 ## FR-003 — `outlook-cli list-mail`
 
 **Purpose.** List the user's N most recent messages in a named folder (default `Inbox`),
-ordered by `ReceivedDateTime desc`.
+ordered by `ReceivedDateTime desc`, optionally filtered by a `ReceivedDateTime` window
+or reduced to a server-side count.
 
-**Inputs.** `-n, --top <N>` (default 10, range 1..100), `--folder <name>` (default
+**Inputs.** `-n, --top <N>` (default 10, range 1..1000), `--folder <name>` (default
 `Inbox`; fast-path well-known set: `Inbox`, `SentItems`, `Drafts`, `DeletedItems`,
 `Archive`; also accepts any other well-known alias — `JunkEmail`, `Outbox`,
 `MsgFolderRoot`, `RecoverableItemsDeletions` — and arbitrary display-name paths such as
 `Inbox/Projects/Alpha`), `--folder-id <id>` (mutually exclusive with `--folder`; skips
 the resolver and calls `/me/MailFolders/{id}/messages` directly), `--folder-parent
 <name-or-path-or-id>` (default `MsgFolderRoot`; anchor for non-well-known `--folder`
-values), `--select <comma-list>` (override selected fields).
-**REST target.** `GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$top=N&$orderby=ReceivedDateTime desc&$select=...`.
+values), `--select <comma-list>` (override selected fields),
+`--from <iso|keyword>` (optional lower bound on `ReceivedDateTime`, inclusive;
+ISO8601 `YYYY-MM-DDTHH:MM:SSZ`, space-separated local-time `YYYY-MM-DD HH:MM:SS`, or
+keyword `now` / `now + Nd` / `now - Nd`), `--to <iso|keyword>` (optional upper bound,
+exclusive; same grammar), `--just-count` (return only the count of matching messages
+via server-side `$count=true`; ignores `--top` and `--select`).
+**REST target.** `GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$top=N&$orderby=ReceivedDateTime desc&$select=...[&$filter=ReceivedDateTime ge X and ReceivedDateTime lt Y]` for the list path;
+`GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$count=true&$top=1&$select=Id[&$filter=...]` for the count path.
 **Outputs (JSON).** Array of message summaries (default fields: `Id`, `Subject`, `From`,
-`ReceivedDateTime`, `HasAttachments`, `IsRead`, `WebLink`).
-**Outputs (table, `--table`).** Columns `Received | From | Subject | Att | Id`.
-**Exit codes.** `0`, `2` (both `--folder` and `--folder-id`; invalid path),
-`3`, `4`, `5` (`UPSTREAM_FOLDER_NOT_FOUND` on bad path / id), `6`.
-**Source.** Refined request §5.3 + folder extension refined-request-folders §5.5.
+`ReceivedDateTime`, `HasAttachments`, `IsRead`, `WebLink`) — or, when `--just-count` is
+set, a single object `{ count: <int>, exact: <bool> }`. `exact: false` signals the
+server did not return `@odata.count` and the count reflects only the first page.
+**Outputs (table, `--table`).** Columns `Received | From | Subject | Att | Id` (list mode);
+the count object is rendered as a single-object payload when `--just-count` is set.
+**Exit codes.** `0`, `2` (both `--folder` and `--folder-id`; invalid path; malformed
+`--from`/`--to`), `3`, `4`, `5` (`UPSTREAM_FOLDER_NOT_FOUND` on bad path / id), `6`.
+**Source.** Refined request §5.3 + folder extension refined-request-folders §5.5 +
+CHANGELOG [1.2.0] (date window) + [1.3.0] (just-count, --top cap 1..1000).
 
 ---
 
@@ -241,6 +252,30 @@ exits 5 while surfacing the full `failed[]` in the JSON payload), `6` (unused).
 
 ---
 
+## FR-012 — `outlook-cli get-thread <id>`
+
+**Purpose.** Retrieve every message in the conversation (thread) that `<id>` belongs
+to, regardless of folder. Enables linear inspection of a reply chain without having
+to know which folder each reply landed in.
+
+**Inputs.** `<id>` positional — either a raw message id (the tool resolves its
+`ConversationId` first via a tight `$select`) or the literal prefix
+`conv:<rawConversationId>` to skip the resolve hop. `--body <html|text|none>`
+(default `text`; `none` omits Body + BodyPreview from `$select`, otherwise both are
+included and passed through untouched — no HTML→text conversion). `--order <asc|desc>`
+(default `asc`, oldest-first; passed as `$orderby=ReceivedDateTime <order>`).
+**REST target.** `GET /api/v2.0/me/messages/{id}?$select=Id,ConversationId` (only in
+raw-id mode) followed by
+`GET /api/v2.0/me/messages?$filter=ConversationId eq '<id>'&$orderby=ReceivedDateTime <order>&$select=...`.
+**Outputs (JSON).** `{ conversationId: <string>, count: <int>, messages: MessageSummary[] }`.
+**Outputs (table, `--table`).** Columns `Received | From | Subject | Id` — renders
+only the `messages` array.
+**Exit codes.** `0`, `2` (empty positional, empty `conv:` suffix, invalid `--body`/`--order`,
+upstream message has no ConversationId), `3`, `4`, `5` (upstream error on either GET).
+**Source.** CHANGELOG [1.2.0].
+
+---
+
 ## Cross-cutting features
 
 ### FF-001 — Global output modes
@@ -249,12 +284,17 @@ Every command supports `--json` (default) and `--table` (mutually exclusive). Pr
 messages go to stderr; JSON / table output goes to stdout. `--quiet` suppresses
 non-result logs.
 
-### FF-002 — Mandatory configuration with no fallback
+### FF-002 — Runtime-plumbing configuration with documented defaults
 
 `OUTLOOK_CLI_HTTP_TIMEOUT_MS`, `OUTLOOK_CLI_LOGIN_TIMEOUT_MS`, and
-`OUTLOOK_CLI_CHROME_CHANNEL` are mandatory. If unset AND not passed via the
-corresponding CLI flag, a typed `ConfigurationError` is raised and the process exits
-with code `3`. No silent defaults. Source: refined request §8.
+`OUTLOOK_CLI_CHROME_CHANNEL` have documented defaults (`30000`, `300000`, `"chrome"`)
+instead of being mandatory. Precedence: CLI flag > env var > default. A **malformed**
+flag or env value (non-integer, non-positive, etc.) still raises
+`ConfigurationError` and exits `3`; the default only covers the unset case.
+No other setting is exempt — any future mandatory setting must continue to throw
+`ConfigurationError` on miss unless a similar exception is recorded in CLAUDE.md.
+Source: refined request §8, superseded by CLAUDE.md "Project-specific exceptions to
+global rules" (2026-04-21, shipped in [1.1.0]).
 
 ### FF-003 — Transparent re-authentication on 401 / expired token
 
@@ -306,3 +346,170 @@ bounded at `5000` visited nodes. Off-host `nextLink` (any hostname other than
 `outlook.office.com`) is rejected as `UpstreamError UPSTREAM_PAGINATION_OFF_HOST`.
 The 401-retry-once envelope applies transparently per page. Source:
 outlook-v2-folder-pagination-filter §5 + §6.
+
+---
+
+## Agent Subcommand (Plan 003)
+
+Source: `docs/design/refined-request-langgraph-agent.md`,
+`docs/design/investigation-langgraph-agent.md`,
+`docs/research/azure-deepseek-tool-calling.md`,
+`docs/design/plan-003-langgraph-agent.md`.
+
+All agent-specific FR numbers use the `FR-AGT-N` prefix to avoid collision
+with the existing `FR-00N` series.
+
+### FR-AGT-1 — `outlook-cli agent [prompt]` subcommand
+
+**Purpose.** Expose a LangGraph.js ReAct agent as a new commander subcommand
+that accepts a natural-language prompt, plans tool calls against the existing
+outlook-cli commands, and returns a final answer. Shares every global flag
+(`--session-file`, `--profile-dir`, `--tz`, `--json`, `--table`, `--quiet`,
+`--no-auto-reauth`, `--log-file`, `--timeout`, `--login-timeout`,
+`--chrome-channel`).
+
+**Inputs.** Positional `prompt` (required unless `--interactive`); `-i`,
+`--provider`, `--model`, `--temperature`, `--max-steps`, `--system`,
+`--system-file`, `--tools`, `--env-file`, `--allow-mutations`,
+`--per-tool-budget`, `--verbose`, `--no-thread` (v1 no-op).
+**Outputs (JSON).** `AgentResult` envelope (see FR-AGT-8).
+**Exit codes.** `0`, `2` usage, `3` config, `4` auth, `5` upstream,
+`6` IO, `1` unexpected, `130` SIGINT in interactive mode.
+
+### FR-AGT-2 — Pluggable LLM provider registry
+
+**Purpose.** Six-entry registry keyed by `openai | anthropic | google |
+azure-openai | azure-anthropic | azure-deepseek`. Each factory is
+self-contained, reads its own required env vars, and returns a LangChain
+`BaseChatModel` ready to `.bindTools(...)`. A seventh provider requires only
+a new factory file + one line in `registry.ts`.
+
+**Source.** Refined §FR-3..FR-4; investigation §3 Provider Registry Blueprint.
+
+### FR-AGT-3 — Mandatory config + no-fallback rule
+
+**Purpose.** Every required env var raises `ConfigurationError`
+(`code: 'CONFIG_MISSING'`, exit 3) naming the missing setting. No silent
+defaults for secrets or endpoints. Precedence: CLI flag > process env >
+`.env` file > NO FALLBACK.
+
+**Source.** Refined §FR-2, §FR-4, NFR-1; CLAUDE.md global rule.
+
+### FR-AGT-4 — `.env` file loading via dotenv
+
+**Purpose.** Optional `.env` (default `./.env`) or `--env-file <path>` loaded
+with `dotenv.config({ override: false })` before any `process.env.OUTLOOK_*`
+read. A missing file with `--env-file` set → `ConfigurationError` exit 3
+(`missingSetting: 'envFile'`). A missing default `.env` is silently ignored.
+`.env` must be git-ignored; `.env.example` is shipped.
+
+**Source.** Refined §FR-2, NFR-2; investigation D6.
+
+### FR-AGT-5 — Tool catalog (MVP set of 11 tools)
+
+**Purpose.** Wrap existing `src/commands/*.run()` as LangChain `tool(...)`
+objects with Zod input schemas:
+- Read-only: `auth_check`, `list_mail`, `get_mail`, `get_thread`,
+  `list_folders`, `find_folder`, `list_calendar`, `get_event`.
+- Mutation (gated by `--allow-mutations`): `create_folder`, `move_mail`,
+  `download_attachments`.
+
+Without `--allow-mutations`, mutation tools are **omitted from the catalog**
+(closed-set registry per NFR-8). Output is JSON-serialized and truncated at
+`OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES` (default `16384`); `Id` fields are
+never truncated.
+
+**Source.** Refined §FR-6, §8; investigation D4, D7.
+
+### FR-AGT-6 — ReAct loop (`createAgent` + MemorySaver)
+
+**Purpose.** Implement the ReAct loop via `createAgent` from `langchain` v1
+(primary) with `createReactAgent` from `@langchain/langgraph/prebuilt` as a
+fallback isolated to `src/agent/graph.ts`. Honor `--max-steps` via
+`recursionLimit`. Terminate on no-tool-call AIMessage, max-steps reached
+(`truncated: true`), fatal error, or SIGINT.
+
+**Source.** Refined §FR-5; investigation D1, D5.
+
+### FR-AGT-7 — Auth-check at boot + ensureSession
+
+**Purpose.** Before constructing the graph, call `auth-check.run`. If status
+is not `ok`:
+- `--no-auto-reauth` → exit 4 (`AuthError`).
+- Otherwise → `doAuthCapture` (existing captureOutlookSession flow under the
+  existing PID lock), then re-run `auth-check`; second failure → exit 4.
+Inside the loop, a 401 is handled by the existing `onReauthNeeded` retry-once
+path; failure becomes either a ToolMessage error (model may recover) or a
+fatal `AuthError` when `--no-auto-reauth` is set.
+
+**Source.** Refined §FR-7; investigation D8.
+
+### FR-AGT-8 — `--json` envelope + `--table` summary
+
+**Purpose.** Default `--json` emits a single object:
+```
+{ provider, model, prompt, finalAnswer, steps[], usage|null, truncated,
+  durationMs, runId }
+```
+`steps[i]` carries `{ index, tool, input, output, error|null, durationMs }`.
+`--table` renders a short `Step | Tool | Status | DurationMs` grid with the
+final answer as a header paragraph. `--verbose` writes the full transcript
+to stderr post-run.
+
+**Source.** Refined §FR-8; codebase-scan §8.
+
+### FR-AGT-9 — Logging & redaction
+
+**Purpose.** Every log line passes through `redactString` from
+`src/util/redact.ts`. `--quiet` suppresses stderr; `--log-file <path>`
+appends JSON-lines (mode `0600`). Records carry `runId` + ISO timestamp.
+Provider API keys and bearer tokens never appear in logs, stdout, or
+envelope output.
+
+**Source.** Refined §FR-9, NFR-1; investigation D12.
+
+### FR-AGT-10 — Interactive REPL
+
+**Purpose.** `-i/--interactive` launches a readline REPL (`outlook-agent>`)
+backed by `MemorySaver` with a stable `thread_id`. Slash commands:
+`/exit`, `/quit` (exit 0), `/clear` (drop thread), `/tools` (list catalog),
+`/system <text>` (replace system prompt), `/help`. Ctrl-C at idle exits
+130; Ctrl-C during a run aborts the invoke and keeps the REPL alive.
+
+**Source.** Refined §FR-11; investigation D5.
+
+### FR-AGT-11 — System prompt override
+
+**Purpose.** Default system prompt (text in investigation §5) with
+`{mutationsEnabled}` template substitution. `--system <text>` and
+`--system-file <path>` override (mutually exclusive — both set → exit 2).
+`--system-file` unreadable → `ConfigurationError` exit 3.
+
+**Source.** Refined §FR-12.
+
+### FR-AGT-12 — `--max-steps` ceiling
+
+**Purpose.** Integer in `[1..50]`, default `10`, env
+`OUTLOOK_AGENT_MAX_STEPS`. Out-of-range → `UsageError` exit 2. Hitting the
+ceiling sets `truncated: true` and exits 0 (not an error).
+
+**Source.** Refined §FR-13.
+
+### FR-AGT-13 — Azure DeepSeek model-variant gating
+
+**Purpose.** `azure-deepseek` factory rejects, at config-load time, model
+names matching any of these patterns (case-insensitive):
+- `deepseek-v3.2-speciale` — tool calling omitted by design.
+- `deepseek-r1` (excluding `deepseek-r1-0528`) — original R1 does not
+  support tool calling on Microsoft Foundry.
+- `deepseek-reasoner`.
+- `mai-ds-r1` — tool calling unconfirmed.
+- `deepseek-r1-0528` — rejected due to `ChatOpenAI` parameter-injection
+  incompatibility (see research §5).
+Accepts V3.x variants and unknown custom deployment names (with a single
+`console.warn` to stderr, suppressed by `--quiet`). Rejection emits
+`ConfigurationError` exit 3 with a message that names the model and
+recommends `DeepSeek-V3.2` or `DeepSeek-V3.1`.
+
+**Source.** Research `docs/research/azure-deepseek-tool-calling.md` §7;
+investigation §7 Risk 3.

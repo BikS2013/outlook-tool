@@ -388,6 +388,110 @@ phase of work has a `plan-NNN-*.md` alongside it.
 
 ---
 
+## Agent mode (LangGraph ReAct)
+
+The `agent` subcommand drives an LLM over the same Outlook surface the
+other subcommands expose, as 11 tool-callable adapters (8 read-only, 3
+mutating). It's a thin layer on top of LangGraph's `createAgent` — the
+cached session, auto-reauth, per-REST-call timeouts, and redaction all
+continue to apply. The LLM decides which tool to call and with which
+arguments; every result is byte-budget-truncated before it reaches the
+model.
+
+### Quick start (OpenAI)
+
+```bash
+export OUTLOOK_AGENT_PROVIDER=openai
+export OUTLOOK_AGENT_MODEL=gpt-4o-mini
+export OUTLOOK_AGENT_OPENAI_API_KEY=sk-...
+outlook-cli agent "list my 3 most recent unread emails"
+```
+
+The result is a JSON envelope with `answer`, `steps[]`, `usage`, and
+`meta` (see `docs/design/project-design.md` §8 for the shape).
+
+### Worked examples
+
+OpenAI one-shot:
+
+```bash
+export OUTLOOK_AGENT_PROVIDER=openai
+export OUTLOOK_AGENT_MODEL=gpt-4o-mini
+export OUTLOOK_AGENT_OPENAI_API_KEY=sk-...
+outlook-cli agent "summarize unread emails from alice@contoso.com this week"
+```
+
+Azure OpenAI interactive REPL (reads a team `.env`):
+
+```bash
+outlook-cli agent --interactive \
+  --provider azure-openai \
+  --env-file ./config/team.env
+# team.env:
+#   OUTLOOK_AGENT_AZURE_OPENAI_API_KEY=...
+#   OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT=https://contoso.openai.azure.com
+#   OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION=2024-10-21
+#   OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT=gpt-4o
+# In the REPL: /exit to quit, /reset to start a new thread.
+```
+
+Azure-hosted DeepSeek with explicit model and mutations enabled:
+
+```bash
+export OUTLOOK_AGENT_PROVIDER=azure-deepseek
+export OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY=...
+export OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT=https://contoso.services.ai.azure.com
+outlook-cli agent \
+  --model DeepSeek-V3.2 \
+  --allow-mutations \
+  "move all emails from alice@contoso.com older than 90 days to Archive"
+```
+
+### `.env` precedence
+
+When `agent` starts it calls `dotenv.config()` BEFORE any
+`OUTLOOK_AGENT_*` env read. The order of precedence is:
+
+1. CLI flag (`--provider openai`)
+2. Process env (`export OUTLOOK_AGENT_PROVIDER=openai`)
+3. `.env` file (`./.env` by default, or the file pointed to by
+   `--env-file <path>`)
+4. Built-in default (optional rows only — mandatory rows raise
+   `ConfigurationError` / exit 3 when unresolved)
+
+Process env always wins over any `.env` file (`override: false`).
+
+### Mutation safety
+
+By default the agent is exposed only to the 8 read-only tools. Adding
+`--allow-mutations` (or `OUTLOOK_AGENT_ALLOW_MUTATIONS=true`) includes
+`create_folder`, `move_mail`, and `download_attachments`. Even when they
+are exposed, the built-in system prompt instructs the LLM to state
+exactly what will be created, moved, or downloaded and to ask for
+explicit confirmation before running a mutating tool.
+
+### Exposed LLM tools
+
+| Tool | Mutating? | What it does |
+|---|---|---|
+| `auth_check` | no | Reports cached-session health. |
+| `list_mail` | no | List/count messages in a folder with optional date window. |
+| `get_mail` | no | Retrieve a single message + attachment metadata. |
+| `get_thread` | no | Retrieve every message in a conversation. |
+| `list_folders` | no | Enumerate mail folders (optionally recursive). |
+| `find_folder` | no | Resolve a folder query to a single id. |
+| `list_calendar` | no | List events in a window. |
+| `get_event` | no | Retrieve one event. |
+| `create_folder` | yes | Create (or idempotently reuse) a folder. |
+| `move_mail` | yes | Move one or more messages to a folder (returns new ids). |
+| `download_attachments` | yes | Save attachment bytes to a directory. |
+
+The full surface, env-var table, and exit-code mapping are in
+`docs/design/configuration-guide.md` and the `<agent>` block in
+`CLAUDE.md`.
+
+---
+
 ## What's new
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the release history. Current version is

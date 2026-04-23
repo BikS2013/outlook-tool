@@ -58,6 +58,7 @@ import { LIST_FOLDERS_COLUMNS } from './commands/list-folders';
 import * as findFolder from './commands/find-folder';
 import * as createFolder from './commands/create-folder';
 import * as moveMail from './commands/move-mail';
+import * as agentCmd from './commands/agent';
 
 // ---------------------------------------------------------------------------
 // Package version (read lazily so --help doesn't need it)
@@ -943,6 +944,95 @@ export async function main(argv: string[]): Promise<number> {
         if (result.failed.length > 0) {
           process.exitCode = 5;
         }
+      }),
+    );
+
+  // -------- agent [prompt] --------
+  program
+    .command('agent [prompt]')
+    .description(
+      'Run the LangGraph ReAct agent over your Outlook mailbox. Supply a prompt or pass --interactive for a REPL.',
+    )
+    .option(
+      '-i, --interactive',
+      'Start an interactive REPL (persists per-session history)',
+      false,
+    )
+    .option(
+      '-p, --provider <name>',
+      'LLM provider (openai, anthropic, google, azure-openai, azure-anthropic, azure-deepseek). Falls back to OUTLOOK_AGENT_PROVIDER.',
+    )
+    .option(
+      '-m, --model <id>',
+      'Model id/deployment name. Falls back to OUTLOOK_AGENT_MODEL.',
+    )
+    .option('--max-steps <n>', 'Max ReAct iterations', (v: string) =>
+      Number.parseInt(v, 10),
+    )
+    .option('--temperature <t>', 'Sampling temperature', (v: string) =>
+      Number.parseFloat(v),
+    )
+    .option('--system <text>', 'Override the default system prompt')
+    .option('--system-file <path>', 'Read the system prompt from a file')
+    .option(
+      '--tools <csv>',
+      'Comma-separated allowlist of tool names; all tools by default',
+    )
+    .option(
+      '--per-tool-budget <bytes>',
+      'Byte budget for a single tool result',
+      (v: string) => Number.parseInt(v, 10),
+    )
+    .option(
+      '--allow-mutations',
+      'Expose mutation tools (create_folder, move_mail, download_attachments). OFF by default.',
+      false,
+    )
+    .option(
+      '--env-file <path>',
+      'Path to a .env file to load (overrides the default cwd/.env lookup). Process env always wins.',
+    )
+    .option('--verbose', 'Emit per-step trace to stderr', false)
+    .action(
+      makeAction<
+        {
+          interactive?: boolean;
+          provider?: string;
+          model?: string;
+          maxSteps?: number;
+          temperature?: number;
+          system?: string;
+          systemFile?: string;
+          tools?: string;
+          perToolBudget?: number;
+          allowMutations?: boolean;
+          envFile?: string;
+          verbose?: boolean;
+        },
+        [string | undefined]
+      >(program, async (deps, g, cmdOpts, prompt) => {
+        const agentOpts: agentCmd.AgentOptions = {
+          interactive: cmdOpts.interactive ?? false,
+          provider: cmdOpts.provider,
+          model: cmdOpts.model,
+          maxSteps: cmdOpts.maxSteps,
+          temperature: cmdOpts.temperature,
+          systemPrompt: cmdOpts.system,
+          systemPromptFile: cmdOpts.systemFile,
+          tools: cmdOpts.tools,
+          perToolBudgetBytes: cmdOpts.perToolBudget,
+          allowMutations: cmdOpts.allowMutations ?? false,
+          envFile: cmdOpts.envFile,
+          verbose: cmdOpts.verbose ?? false,
+          logFile: g.logFile,
+          noAutoReauth: g.autoReauth === false,
+          quiet: g.quiet === true,
+        };
+        const result = await agentCmd.run(deps, prompt ?? null, agentOpts);
+        if (result) {
+          emitResult(result, resolveOutputMode(g));
+        }
+        // interactive returns void; its own REPL has already drained stdout.
       }),
     );
 

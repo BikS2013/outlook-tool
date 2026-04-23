@@ -400,3 +400,153 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
     </info>
 </outlook-cli>
 
+<agent>
+    <objective>
+        Run a LangGraph ReAct agent over the user's Outlook mailbox. The
+        agent drives an LLM through the same read / folder / calendar
+        surface the `outlook-cli` subcommands expose, but as 11 tool-callable
+        adapters (8 read-only, 3 mutating — gated by `--allow-mutations`).
+        The session layer, redaction, auto-reauth, and per-REST-call
+        timeouts all stay in force — the agent simply asks the LLM to
+        choose which of those existing tools to call and with which args.
+    </objective>
+    <command>
+        # One-shot — a single prompt, structured answer on stdout
+        npx ts-node src/cli.ts agent "list my 3 most recent unread emails"
+
+        # Interactive REPL — slash commands /exit and /reset inside the session
+        npx ts-node src/cli.ts agent --interactive
+    </command>
+    <info>
+        Flags (every flag also has an env var — see provider table below):
+
+        - `-i, --interactive`            Start a REPL. Mutually tolerated
+                                         with a positional prompt (prompt
+                                         is ignored with a stderr note).
+        - `-p, --provider <name>`        `openai | anthropic | google |
+                                         azure-openai | azure-anthropic |
+                                         azure-deepseek`. Env:
+                                         `OUTLOOK_AGENT_PROVIDER`. MANDATORY.
+        - `-m, --model <id>`             Model id or Azure deployment name.
+                                         Env: `OUTLOOK_AGENT_MODEL`. MANDATORY.
+        - `--max-steps <n>`              Max ReAct iterations (positive int).
+                                         Env: `OUTLOOK_AGENT_MAX_STEPS`.
+                                         Default: 10.
+        - `--temperature <t>`            Sampling temperature (non-negative
+                                         float). Env: `OUTLOOK_AGENT_TEMPERATURE`.
+                                         Default: 0.
+        - `--system <text>`              Inline system prompt override. Env:
+                                         `OUTLOOK_AGENT_SYSTEM_PROMPT`. Mutually
+                                         exclusive with `--system-file`.
+        - `--system-file <path>`         Read prompt from UTF-8 file. Env:
+                                         `OUTLOOK_AGENT_SYSTEM_PROMPT_FILE`.
+        - `--tools <csv>`                Comma-separated allowlist of tool
+                                         names. Env: `OUTLOOK_AGENT_TOOLS`.
+                                         Default: the full permitted set.
+        - `--per-tool-budget <bytes>`    Max byte-length of a single tool
+                                         result injected into the LLM. Env:
+                                         `OUTLOOK_AGENT_PER_TOOL_BUDGET_BYTES`
+                                         (also accepts the legacy
+                                         `OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES`).
+                                         Default: 16384.
+        - `--allow-mutations`            Include the 3 mutation tools
+                                         (`create_folder`, `move_mail`,
+                                         `download_attachments`). Env:
+                                         `OUTLOOK_AGENT_ALLOW_MUTATIONS`.
+                                         Default: `false`.
+        - `--env-file <path>`            Load a `.env` file from `<path>`
+                                         before reading any `OUTLOOK_AGENT_*`
+                                         var. Process env always wins;
+                                         dotenv passes `override: false`.
+                                         Without the flag, the agent still
+                                         loads `./.env` if present.
+        - `--verbose`                    Emit per-step trace to stderr.
+
+        Global flags from the top-level CLI (`--log-file`, `--no-auto-reauth`,
+        `--quiet`, `--json`, `--table`) are honored. The agent reuses the
+        shared session store and Chrome capture plumbing — no separate auth.
+
+        Exit codes (reuses the taxonomy in `<outlook-cli>`):
+          0  success (including "finished but no final answer due to
+              max-steps" — envelope includes `meta.terminatedBy: "maxSteps"`)
+          2  usage error (missing prompt without `--interactive`, invalid
+              flag values, `--tools ""`, etc.)
+          3  configuration error (missing `OUTLOOK_AGENT_PROVIDER` /
+              `OUTLOOK_AGENT_MODEL` / provider-specific creds)
+          4  auth failure (`--no-auto-reauth` + expired/missing session)
+          5  upstream error (surfaced by tool adapters)
+          6  IO error (session write, `download_attachments` collisions)
+
+        Providers → env var prefixes:
+
+        ```
+        openai            OUTLOOK_AGENT_OPENAI_*            _API_KEY (req), _BASE_URL, _ORG
+        anthropic         OUTLOOK_AGENT_ANTHROPIC_*         _API_KEY (req), _BASE_URL
+        google            OUTLOOK_AGENT_GOOGLE_*            _API_KEY (req)
+        azure-openai      OUTLOOK_AGENT_AZURE_OPENAI_*      _API_KEY, _ENDPOINT, _API_VERSION,
+                                                            _DEPLOYMENT (all required)
+        azure-anthropic   OUTLOOK_AGENT_AZURE_AI_INFERENCE_ _KEY, _ENDPOINT (both req), +
+                          OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL (optional)
+        azure-deepseek    OUTLOOK_AGENT_AZURE_AI_INFERENCE_ _KEY, _ENDPOINT (both req), +
+                          OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL (optional; denylisted models
+                          rejected at config load)
+        ```
+
+        Exposed LLM tools:
+          Read-only (always on): `auth_check`, `list_mail`, `get_mail`,
+            `get_thread`, `list_folders`, `find_folder`, `list_calendar`,
+            `get_event`.
+          Mutating (`--allow-mutations` required): `create_folder`,
+            `move_mail`, `download_attachments`.
+
+        `.env` precedence: CLI flag > process env > `.env` file > default
+        (optional rows only). Mandatory rows raise `ConfigurationError`
+        (exit 3) when unresolved.
+
+        Examples:
+
+        OpenAI one-shot (JSON envelope to stdout):
+        ```bash
+        export OUTLOOK_AGENT_PROVIDER=openai
+        export OUTLOOK_AGENT_MODEL=gpt-4o-mini
+        export OUTLOOK_AGENT_OPENAI_API_KEY=sk-...
+        npx ts-node src/cli.ts agent "summarize my 5 most recent unread emails"
+        ```
+
+        Azure OpenAI interactive REPL (reads secrets from a team .env file):
+        ```bash
+        npx ts-node src/cli.ts agent --interactive \
+          --provider azure-openai \
+          --env-file ./config/team.env
+        # .env contains:
+        # OUTLOOK_AGENT_AZURE_OPENAI_API_KEY=...
+        # OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT=https://contoso.openai.azure.com
+        # OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION=2024-10-21
+        # OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT=gpt-4o
+        ```
+
+        Azure-hosted DeepSeek with explicit model + mutations:
+        ```bash
+        export OUTLOOK_AGENT_PROVIDER=azure-deepseek
+        export OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY=...
+        export OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT=https://contoso.services.ai.azure.com
+        npx ts-node src/cli.ts agent \
+          --model DeepSeek-V3.2 \
+          --allow-mutations \
+          "move all emails from alice@contoso.com older than 90 days to Archive"
+        ```
+
+        Security notes:
+        - Every string the logger writes to stderr or a log file is passed
+          through `redactString` first — the bearer token, session cookies,
+          and Authorization headers never appear in agent output.
+        - Tool results are capped at `perToolBudgetBytes` before reaching
+          the LLM, so a giant attachment list cannot inflate the context.
+        - Mutation tools (`create_folder`, `move_mail`,
+          `download_attachments`) are OFF by default. Turning them on
+          requires the explicit `--allow-mutations` flag AND the agent
+          system prompt still asks for user confirmation before any
+          irreversible action.
+    </info>
+</agent>
+

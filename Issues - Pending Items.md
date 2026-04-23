@@ -157,6 +157,45 @@
 
 <!-- Completed items moved here. -->
 
+### BLOCKER / MAJOR fixes applied during 2026-04-23 agent Phase 7 review
+
+- **[fixed] [agent-azure-foundry-env-mismatch]** `azure-anthropic` and
+  `azure-deepseek` factories now read the shared
+  `OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY` /
+  `OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT` env vars per design
+  §5.5 / §5.6. Endpoint normalization (strip trailing `/`, strip a
+  trailing `/models`, append `/anthropic` or `/openai/v1`) is
+  implemented in a shared helper `normalizeFoundryEndpoint` at
+  `src/agent/providers/util.ts` and exercised by the two factories.
+  `OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL` /
+  `OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL` are treated as
+  user-convenience aliases of `OUTLOOK_AGENT_MODEL`; the factories
+  cross-check against `cfg.model` and raise `UsageError` on
+  disagreement. Tests rewritten in
+  `test_scripts/agent-provider-registry.spec.ts` plus new
+  `test_scripts/agent-provider-util.spec.ts` cover the four
+  normalization variants (no suffix, `/`, `/models`, `/models/`).
+
+- **[fixed] [agent-azure-deepseek-denylist-incomplete]** DeepSeek
+  denylist expanded to the full research §7 set:
+  `/deepseek-v3\.2-speciale/i`, `/deepseek-r1(?!-0528)/i`,
+  `/deepseek-reasoner/i`, `/mai-ds-r1/i`, `/deepseek-r1-0528/i`.
+  Rejection now raises `ConfigurationError({ missingSetting:
+  'OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL' })` with a descriptive detail
+  message listing the accepted V3.x variants. Allowlist tests cover
+  V3, V3.1, V3.2; denylist tests exercise every pattern in both
+  casings.
+
+- **[fixed] [agent-stub-AgentConfig-drift]** `src/agent/tools/types.ts`
+  now imports the real `AgentConfig` from `src/config/agent-config.ts`
+  and the real `AgentDeps` from `src/commands/agent.ts`; the
+  forward-stub interfaces were deleted. Consequently, the structural
+  `deps as any` / `cfg as any` casts in `src/commands/agent.ts`
+  around the `buildToolCatalog(...)` call were removed. Tests that
+  constructed stub `AgentConfig` values were updated to use the real
+  field names (`provider` instead of `providerName`, added
+  `providerEnv`, dropped `quiet`/`logFilePath`/`runId`).
+
 ### BLOCKER / MAJOR fixes applied during 2026-04-21 folder-management review (Phase 7)
 
 - **[fixed] `list-mail` did not accept display-name paths in `--folder`
