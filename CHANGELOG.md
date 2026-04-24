@@ -8,6 +8,186 @@ Dates are ISO8601 (local calendar day).
 
 ---
 
+## [2.1.0] — 2026-04-24
+
+### Changed — BEHAVIORAL (config precedence reversed)
+
+**The `~/.tool-agents/outlook-cli/.env` file now OVERRIDES shell environment
+variables.** This is a deliberate reversal of the cli-agent-builder canonical
+"shell-wins" precedence and a project-specific policy recorded in the
+`cli-agent-builder` subagent definition.
+
+**New precedence:**
+```
+CLI flag > ~/.tool-agents/outlook-cli/.env > process env
+  > cwd/.env (--env-file) > ~/.tool-agents/outlook-cli/config.json
+  > default (optional) / throw (mandatory)
+```
+
+**Implementation:** `ensureAgentConfigFolder` now calls
+`dotenv.config({ override: true })` on the folder `.env`. CLI flags still
+win over everything because they are read before `process.env` resolution.
+
+**Rationale:** The per-user folder holds durable, intentional configuration.
+A stale shell export left over from another project — e.g.
+`export AZURE_OPENAI_DEPLOYMENT=gpt-5.1` in `~/.zshrc` — must not silently
+shadow the user's deliberately-set folder value. If you want a shell export
+to take effect, either remove the folder `.env` entry or pass the value via
+`--` CLI flag.
+
+**Migration:** Any user who was relying on shell-wins behavior must either
+(a) clear or comment out the conflicting line in
+`~/.tool-agents/outlook-cli/.env`, or (b) use a `--` CLI flag for the
+override they want.
+
+### Changed — seeded `.env` template
+
+The seeded `~/.tool-agents/outlook-cli/.env` now has ALL credential lines
+commented out (including `OPENAI_API_KEY`, which previously was active as
+`OPENAI_API_KEY=REPLACE_ME`). This prevents the seeded placeholder from
+clobbering real shell values via the new override behavior. Users uncomment
+only the lines they need.
+
+### Fixed
+
+- **Config folder path renamed `~/tool-agents/` → `~/.tool-agents/`** to
+  follow the POSIX convention for hidden per-user config directories. The
+  previous un-dotted path was a leftover from an earlier implementation
+  pass and created two folders (one live, one orphaned) on existing systems.
+- **Test isolation bug in `agent-config.spec.ts`**: tests now stub `HOME`
+  to a `tmpdir` in `beforeAll`, preventing them from reading developers'
+  real `~/.tool-agents/outlook-cli/.env`.
+- **Lazy `os.homedir()` resolution in `agent-config-folder.ts`**: the
+  `toolAgentsRoot()` helper is now called at each `getAgentConfigFolderPath`
+  invocation instead of being baked into a module-level constant. Module-
+  level capture silently bypassed test `HOME` stubs.
+
+---
+
+## [2.0.0] — 2026-04-24
+
+### BREAKING CHANGES
+
+Provider credential environment variable names have been renamed from
+`OUTLOOK_AGENT_`-prefixed names to the vendor-documented standard names.
+The control variables (provider, model, max-steps, etc.) are unchanged.
+
+**Rename map:**
+
+| Old name (1.x) | New name (2.0) |
+|---|---|
+| `OUTLOOK_AGENT_OPENAI_API_KEY` | `OPENAI_API_KEY` |
+| `OUTLOOK_AGENT_OPENAI_BASE_URL` | `OPENAI_BASE_URL` |
+| `OUTLOOK_AGENT_OPENAI_ORG` | `OPENAI_ORG_ID` |
+| `OUTLOOK_AGENT_ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` |
+| `OUTLOOK_AGENT_ANTHROPIC_BASE_URL` | `ANTHROPIC_BASE_URL` |
+| `OUTLOOK_AGENT_GOOGLE_API_KEY` | `GOOGLE_API_KEY` (also `GEMINI_API_KEY`) |
+| `OUTLOOK_AGENT_AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_API_KEY` |
+| `OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT` | `AZURE_OPENAI_ENDPOINT` |
+| `OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION` | `AZURE_OPENAI_API_VERSION` |
+| `OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT` | `AZURE_OPENAI_DEPLOYMENT` |
+| `OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY` | `AZURE_AI_INFERENCE_KEY` |
+| `OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT` | `AZURE_AI_INFERENCE_ENDPOINT` |
+| `OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL` | `AZURE_ANTHROPIC_MODEL` |
+| `OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL` | `AZURE_DEEPSEEK_MODEL` |
+
+**Control vars (unchanged — do NOT rename):**
+`OUTLOOK_AGENT_PROVIDER`, `OUTLOOK_AGENT_MODEL`, `OUTLOOK_AGENT_MAX_STEPS`,
+`OUTLOOK_AGENT_TEMPERATURE`, `OUTLOOK_AGENT_SYSTEM_PROMPT`,
+`OUTLOOK_AGENT_SYSTEM_PROMPT_FILE`, `OUTLOOK_AGENT_TOOLS`,
+`OUTLOOK_AGENT_PER_TOOL_BUDGET_BYTES`, `OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES`,
+`OUTLOOK_AGENT_ALLOW_MUTATIONS`, `OUTLOOK_AGENT_MEMORY_FILE`, `OUTLOOK_AGENT_MODEL_FILE`.
+
+**Provider `google` → `gemini`:**
+The provider id `google` is now deprecated. It is still accepted at runtime
+(normalised to `gemini`) with a deprecation warning on stderr, but support
+will be removed in a future version. Update your `OUTLOOK_AGENT_PROVIDER`
+value from `google` to `gemini`.
+
+### Added
+
+- **`local-openai` provider** (B1) — new sixth canonical provider slot that
+  speaks the OpenAI wire format. Reads `OPENAI_BASE_URL` (first), then
+  `LOCAL_OPENAI_BASE_URL`, then `OLLAMA_HOST` (mapped to
+  `http://<host>/v1`). `OPENAI_API_KEY` is optional (defaults to
+  `"not-needed"` for local servers that don't enforce authentication).
+
+- **`~/.tool-agents/outlook-cli/` config folder** (B3) — per-user
+  configuration folder created on first agent invocation:
+  - `~/.tool-agents/outlook-cli/` mode 0700
+  - `.env` mode 0600 — seeded with placeholder values only (never copies
+    from `process.env`). Contains `OPENAI_API_KEY=REPLACE_ME` etc.
+  - `config.json` mode 0600 — non-secret runtime defaults (`provider`,
+    `model`, `maxSteps`, `temperature`, `perToolBudgetBytes`,
+    `allowMutations`, `tools`, etc.). Schema version 1. Validated by Zod
+    at load time; malformed files are reported but never auto-overwritten.
+  - Expiry hint checking: if `apiKeyExpiresAt`, `azureKeyExpiresAt`, or
+    `expiresAt` fields are present in `config.json` and within 7 days of
+    the current date, a warning is written to stderr on startup.
+
+- **Extended configuration precedence chain** (B3) — now:
+  `CLI flag > process env > cwd/.env (caller) > ~/.tool-agents/outlook-cli/.env
+  > ~/.tool-agents/outlook-cli/config.json > default / throw`.
+
+- **`--base-url <url>` CLI flag** (R2) — overrides the LLM provider base
+  URL. For `openai` and `local-openai` it is injected as `OPENAI_BASE_URL`
+  into the `providerEnv` snapshot.
+
+- **`--config <path>` CLI flag** (R3) — overrides the
+  `~/.tool-agents/outlook-cli/config.json` path. Can point at the file
+  directly (`*.json`) or at the containing folder.
+
+- **`GEMINI_API_KEY` alias** — accepted as an alias for `GOOGLE_API_KEY`
+  in the `gemini` provider factory.
+
+- **`docs/reference/config.json.example`** (C2) — canonical shape
+  template for the `~/.tool-agents/outlook-cli/config.json` file with
+  `"schemaVersion": 1`, placeholder keys for every provider, and
+  `expiresAt` field hints.
+
+- **Expiry-date checking** (C3) — `apiKeyExpiresAt`, `azureKeyExpiresAt`,
+  and `expiresAt` ISO8601 fields in `config.json` trigger a stderr warning
+  when within 7 days of expiry.
+
+### Changed
+
+- **Provider id `google` → `gemini`** (R1) — the canonical id is now
+  `gemini`. Deprecated alias `google` is accepted at parse time, normalised
+  to `gemini`, and emits exactly one deprecation warning to stderr.
+
+- **`azure-deepseek` is a project-extension provider** (R4) — it is NOT
+  part of the canonical 6-slot standard set (which is: `openai`,
+  `anthropic`, `gemini`, `azure-openai`, `azure-anthropic`, `local-openai`).
+  Documentation and code comments updated accordingly.
+
+- **TUI `/model` flag-to-env table** — updated to use the new standard
+  credential env var names (e.g. `--api-key` now maps to `OPENAI_API_KEY`
+  instead of `OUTLOOK_AGENT_OPENAI_API_KEY`). `local-openai` and `gemini`
+  entries added.
+
+### Migration guide (1.x → 2.0)
+
+1. In your `.env` file (or shell `export` statements), rename credential
+   vars per the table above. Control vars (`OUTLOOK_AGENT_PROVIDER`, etc.)
+   are unchanged.
+
+2. If you set `OUTLOOK_AGENT_PROVIDER=google`, change it to
+   `OUTLOOK_AGENT_PROVIDER=gemini`. The old value still works but emits a
+   deprecation warning on every startup.
+
+3. If you use `local-openai` (new): set `OPENAI_BASE_URL` or
+   `LOCAL_OPENAI_BASE_URL` (or `OLLAMA_HOST`) and optionally `OPENAI_API_KEY`.
+
+4. On first startup, `~/.tool-agents/outlook-cli/` is created and seeded.
+   Inspect `.env` there and fill in your credential values (replace the
+   `REPLACE_ME` placeholders). Process env always wins over the folder .env.
+
+5. If you use `/model` TUI commands with `--api-key` or `--endpoint` flags,
+   the flag-to-env mapping now uses the standard names — no flag rename is
+   needed, only the underlying env vars changed.
+
+---
+
 ## [1.3.0] — 2026-04-22
 
 ### Added

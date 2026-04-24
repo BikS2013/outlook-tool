@@ -28,9 +28,10 @@ import { generateId } from "./new-thread";
 const VALID_PROVIDERS: readonly ProviderName[] = [
   "openai",
   "anthropic",
-  "google",
+  "gemini",
   "azure-openai",
   "azure-anthropic",
+  "local-openai",
   "azure-deepseek",
 ] as const;
 
@@ -46,30 +47,34 @@ function isValidProvider(s: string): s is ProviderName {
  */
 const FLAG_TO_ENV: Readonly<Record<ProviderName, Readonly<Record<string, string>>>> = {
   openai: {
-    "--api-key": "OUTLOOK_AGENT_OPENAI_API_KEY",
-    "--base-url": "OUTLOOK_AGENT_OPENAI_BASE_URL",
-    "--org": "OUTLOOK_AGENT_OPENAI_ORG",
+    "--api-key": "OPENAI_API_KEY",
+    "--base-url": "OPENAI_BASE_URL",
+    "--org": "OPENAI_ORG_ID",
   },
   anthropic: {
-    "--api-key": "OUTLOOK_AGENT_ANTHROPIC_API_KEY",
-    "--base-url": "OUTLOOK_AGENT_ANTHROPIC_BASE_URL",
+    "--api-key": "ANTHROPIC_API_KEY",
+    "--base-url": "ANTHROPIC_BASE_URL",
   },
-  google: {
-    "--api-key": "OUTLOOK_AGENT_GOOGLE_API_KEY",
+  gemini: {
+    "--api-key": "GOOGLE_API_KEY",
   },
   "azure-openai": {
-    "--api-key": "OUTLOOK_AGENT_AZURE_OPENAI_API_KEY",
-    "--endpoint": "OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT",
-    "--api-version": "OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION",
-    "--deployment": "OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT",
+    "--api-key": "AZURE_OPENAI_API_KEY",
+    "--endpoint": "AZURE_OPENAI_ENDPOINT",
+    "--api-version": "AZURE_OPENAI_API_VERSION",
+    "--deployment": "AZURE_OPENAI_DEPLOYMENT",
   },
   "azure-anthropic": {
-    "--key": "OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY",
-    "--endpoint": "OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT",
+    "--key": "AZURE_AI_INFERENCE_KEY",
+    "--endpoint": "AZURE_AI_INFERENCE_ENDPOINT",
+  },
+  "local-openai": {
+    "--base-url": "OPENAI_BASE_URL",
+    "--api-key": "OPENAI_API_KEY",
   },
   "azure-deepseek": {
-    "--key": "OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY",
-    "--endpoint": "OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT",
+    "--key": "AZURE_AI_INFERENCE_KEY",
+    "--endpoint": "AZURE_AI_INFERENCE_ENDPOINT",
   },
 };
 

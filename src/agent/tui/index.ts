@@ -96,14 +96,18 @@ function providerDisplay(p: ProviderName): string {
       return "OpenAI";
     case "anthropic":
       return "Anthropic";
-    case "google":
-      return "Google";
+    case "gemini":
+      return "Google Gemini";
     case "azure-openai":
       return "Azure OpenAI";
     case "azure-anthropic":
       return "Azure Anthropic";
+    case "local-openai":
+      return "Local (OpenAI-compatible)";
     case "azure-deepseek":
       return "Azure DeepSeek";
+    default:
+      return String(p);
   }
 }
 

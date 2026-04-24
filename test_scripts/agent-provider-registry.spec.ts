@@ -1,8 +1,11 @@
 // test_scripts/agent-provider-registry.spec.ts
 //
-// Unit tests for the six provider factories plus the registry surface.
+// Unit tests for the seven provider factories plus the registry surface.
 // Factories MUST NOT call the network at construction time — we assert only
 // on class identity and thrown errors.
+//
+// v2.0.0: credential env vars use standard vendor-documented names.
+// Provider `google` → `gemini`; new `local-openai` slot added.
 
 import { describe, it, expect } from 'vitest';
 
@@ -19,10 +22,11 @@ import { UsageError } from '../src/commands/list-mail';
 
 import { createOpenaiModel } from '../src/agent/providers/openai';
 import { createAnthropicModel } from '../src/agent/providers/anthropic';
-import { createGoogleModel } from '../src/agent/providers/google';
+import { createGeminiModel } from '../src/agent/providers/gemini';
 import { createAzureOpenaiModel } from '../src/agent/providers/azure-openai';
 import { createAzureAnthropicModel } from '../src/agent/providers/azure-anthropic';
 import { createAzureDeepseekModel } from '../src/agent/providers/azure-deepseek';
+import { createLocalOpenaiModel } from '../src/agent/providers/local-openai';
 import {
   PROVIDERS,
   getProvider,
@@ -88,7 +92,7 @@ describe('createOpenaiModel', () => {
       provider: 'openai',
       model: 'gpt-4o-mini',
       providerEnv: freezeEnv({
-        OUTLOOK_AGENT_OPENAI_API_KEY: 'sk-test',
+        OPENAI_API_KEY: 'sk-test',
       }),
     });
     const m = createOpenaiModel(cfg);
@@ -102,32 +106,32 @@ describe('createOpenaiModel', () => {
     const cfg = makeCfg({
       provider: 'openai',
       providerEnv: freezeEnv({
-        OUTLOOK_AGENT_OPENAI_API_KEY: 'sk-test',
-        OUTLOOK_AGENT_OPENAI_BASE_URL: 'https://proxy.example.com/v1',
-        OUTLOOK_AGENT_OPENAI_ORG: 'org-abc',
+        OPENAI_API_KEY: 'sk-test',
+        OPENAI_BASE_URL: 'https://proxy.example.com/v1',
+        OPENAI_ORG_ID: 'org-abc',
       }),
     });
     expect(() => createOpenaiModel(cfg)).not.toThrow();
   });
 
-  it('throws ConfigurationError(OUTLOOK_AGENT_OPENAI_API_KEY) when API key is missing', () => {
+  it('throws ConfigurationError(OPENAI_API_KEY) when API key is missing', () => {
     const cfg = makeCfg({ provider: 'openai', providerEnv: freezeEnv({}) });
     expectMissingSetting(
       createOpenaiModel,
       cfg,
-      'OUTLOOK_AGENT_OPENAI_API_KEY',
+      'OPENAI_API_KEY',
     );
   });
 
   it('throws ConfigurationError when API key is empty string', () => {
     const cfg = makeCfg({
       provider: 'openai',
-      providerEnv: freezeEnv({ OUTLOOK_AGENT_OPENAI_API_KEY: '' }),
+      providerEnv: freezeEnv({ OPENAI_API_KEY: '' }),
     });
     expectMissingSetting(
       createOpenaiModel,
       cfg,
-      'OUTLOOK_AGENT_OPENAI_API_KEY',
+      'OPENAI_API_KEY',
     );
   });
 });
@@ -142,7 +146,7 @@ describe('createAnthropicModel', () => {
       provider: 'anthropic',
       model: 'claude-sonnet-4-5',
       providerEnv: freezeEnv({
-        OUTLOOK_AGENT_ANTHROPIC_API_KEY: 'sk-ant-test',
+        ANTHROPIC_API_KEY: 'sk-ant-test',
       }),
     });
     const m = createAnthropicModel(cfg);
@@ -153,14 +157,14 @@ describe('createAnthropicModel', () => {
     const cfg = makeCfg({
       provider: 'anthropic',
       providerEnv: freezeEnv({
-        OUTLOOK_AGENT_ANTHROPIC_API_KEY: 'sk-ant-test',
-        OUTLOOK_AGENT_ANTHROPIC_BASE_URL: 'https://proxy.example.com',
+        ANTHROPIC_API_KEY: 'sk-ant-test',
+        ANTHROPIC_BASE_URL: 'https://proxy.example.com',
       }),
     });
     expect(() => createAnthropicModel(cfg)).not.toThrow();
   });
 
-  it('throws ConfigurationError(OUTLOOK_AGENT_ANTHROPIC_API_KEY) when missing', () => {
+  it('throws ConfigurationError(ANTHROPIC_API_KEY) when missing', () => {
     const cfg = makeCfg({
       provider: 'anthropic',
       providerEnv: freezeEnv({}),
@@ -168,34 +172,47 @@ describe('createAnthropicModel', () => {
     expectMissingSetting(
       createAnthropicModel,
       cfg,
-      'OUTLOOK_AGENT_ANTHROPIC_API_KEY',
+      'ANTHROPIC_API_KEY',
     );
   });
 });
 
 // ---------------------------------------------------------------------------
-// google
+// gemini (replaces google)
 // ---------------------------------------------------------------------------
 
-describe('createGoogleModel', () => {
-  it('constructs ChatGoogleGenerativeAI when API key is present', () => {
+describe('createGeminiModel', () => {
+  it('constructs ChatGoogleGenerativeAI when GOOGLE_API_KEY is present', () => {
     const cfg = makeCfg({
-      provider: 'google',
+      provider: 'gemini',
       model: 'gemini-2.5-pro',
       providerEnv: freezeEnv({
-        OUTLOOK_AGENT_GOOGLE_API_KEY: 'AIza-test',
+        GOOGLE_API_KEY: 'AIza-test',
       }),
     });
-    const m = createGoogleModel(cfg);
+    const m = createGeminiModel(cfg);
     expect(m).toBeInstanceOf(ChatGoogleGenerativeAI);
   });
 
-  it('throws ConfigurationError(OUTLOOK_AGENT_GOOGLE_API_KEY) when missing', () => {
-    const cfg = makeCfg({ provider: 'google', providerEnv: freezeEnv({}) });
+  it('accepts GEMINI_API_KEY as alias for GOOGLE_API_KEY', () => {
+    const cfg = makeCfg({
+      provider: 'gemini',
+      model: 'gemini-2.5-pro',
+      providerEnv: freezeEnv({
+        GEMINI_API_KEY: 'AIza-alias-test',
+      }),
+    });
+    expect(() => createGeminiModel(cfg)).not.toThrow();
+    const m = createGeminiModel(cfg);
+    expect(m).toBeInstanceOf(ChatGoogleGenerativeAI);
+  });
+
+  it('throws ConfigurationError(GOOGLE_API_KEY) when neither key is present', () => {
+    const cfg = makeCfg({ provider: 'gemini', providerEnv: freezeEnv({}) });
     expectMissingSetting(
-      createGoogleModel,
+      createGeminiModel,
       cfg,
-      'OUTLOOK_AGENT_GOOGLE_API_KEY',
+      'GOOGLE_API_KEY',
     );
   });
 });
@@ -206,10 +223,10 @@ describe('createGoogleModel', () => {
 
 describe('createAzureOpenaiModel', () => {
   const fullEnv = {
-    OUTLOOK_AGENT_AZURE_OPENAI_API_KEY: 'azkey',
-    OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT: 'https://resource.openai.azure.com',
-    OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT: 'gpt4o-deploy',
-    OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION: '2024-10-21',
+    AZURE_OPENAI_API_KEY: 'azkey',
+    AZURE_OPENAI_ENDPOINT: 'https://resource.openai.azure.com',
+    AZURE_OPENAI_DEPLOYMENT: 'gpt4o-deploy',
+    AZURE_OPENAI_API_VERSION: '2024-10-21',
   };
 
   it('constructs AzureChatOpenAI when all required vars are present', () => {
@@ -222,9 +239,8 @@ describe('createAzureOpenaiModel', () => {
     expect(m).toBeInstanceOf(AzureChatOpenAI);
   });
 
-  it('constructs without OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION (optional)', () => {
-    const { OUTLOOK_AGENT_AZURE_OPENAI_API_VERSION: _dropped, ...rest } =
-      fullEnv;
+  it('constructs without AZURE_OPENAI_API_VERSION (optional)', () => {
+    const { AZURE_OPENAI_API_VERSION: _dropped, ...rest } = fullEnv;
     void _dropped;
     const cfg = makeCfg({
       provider: 'azure-openai',
@@ -235,9 +251,9 @@ describe('createAzureOpenaiModel', () => {
   });
 
   for (const key of [
-    'OUTLOOK_AGENT_AZURE_OPENAI_API_KEY',
-    'OUTLOOK_AGENT_AZURE_OPENAI_ENDPOINT',
-    'OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT',
+    'AZURE_OPENAI_API_KEY',
+    'AZURE_OPENAI_ENDPOINT',
+    'AZURE_OPENAI_DEPLOYMENT',
   ] as const) {
     it(`throws ConfigurationError(${key}) when missing`, () => {
       const partial = { ...fullEnv } as Record<string, string>;
@@ -258,9 +274,9 @@ describe('createAzureOpenaiModel', () => {
 
 describe('createAzureAnthropicModel', () => {
   const fullEnv = {
-    OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT:
+    AZURE_AI_INFERENCE_ENDPOINT:
       'https://resource.services.ai.azure.com',
-    OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY: 'azai-key',
+    AZURE_AI_INFERENCE_KEY: 'azai-key',
   };
 
   it('constructs ChatAnthropic when all required vars are present', () => {
@@ -273,33 +289,33 @@ describe('createAzureAnthropicModel', () => {
     expect(m).toBeInstanceOf(ChatAnthropic);
   });
 
-  it('accepts OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL when it matches cfg.model', () => {
+  it('accepts AZURE_ANTHROPIC_MODEL when it matches cfg.model', () => {
     const cfg = makeCfg({
       provider: 'azure-anthropic',
       model: 'claude-opus-4-7',
       providerEnv: freezeEnv({
         ...fullEnv,
-        OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL: 'claude-opus-4-7',
+        AZURE_ANTHROPIC_MODEL: 'claude-opus-4-7',
       }),
     });
     expect(() => createAzureAnthropicModel(cfg)).not.toThrow();
   });
 
-  it('throws UsageError when OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL disagrees with cfg.model', () => {
+  it('throws UsageError when AZURE_ANTHROPIC_MODEL disagrees with cfg.model', () => {
     const cfg = makeCfg({
       provider: 'azure-anthropic',
       model: 'claude-opus-4-7',
       providerEnv: freezeEnv({
         ...fullEnv,
-        OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL: 'claude-sonnet-4-5',
+        AZURE_ANTHROPIC_MODEL: 'claude-sonnet-4-5',
       }),
     });
     expect(() => createAzureAnthropicModel(cfg)).toThrow(UsageError);
   });
 
   for (const key of [
-    'OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT',
-    'OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY',
+    'AZURE_AI_INFERENCE_ENDPOINT',
+    'AZURE_AI_INFERENCE_KEY',
   ] as const) {
     it(`throws ConfigurationError(${key}) when missing`, () => {
       const partial = { ...fullEnv } as Record<string, string>;
@@ -320,9 +336,9 @@ describe('createAzureAnthropicModel', () => {
 
 describe('createAzureDeepseekModel', () => {
   const baseEnv = {
-    OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT:
+    AZURE_AI_INFERENCE_ENDPOINT:
       'https://resource.services.ai.azure.com',
-    OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY: 'azai-key',
+    AZURE_AI_INFERENCE_KEY: 'azai-key',
   };
 
   it('constructs ChatOpenAI for allowed model DeepSeek-V3.2', () => {
@@ -373,7 +389,7 @@ describe('createAzureDeepseekModel', () => {
     'mai-ds-r1',
   ];
   for (const model of deniedModels) {
-    it(`rejects ${model} with ConfigurationError (missingSetting=OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL)`, () => {
+    it(`rejects ${model} with ConfigurationError (missingSetting=AZURE_DEEPSEEK_MODEL)`, () => {
       const cfg = makeCfg({
         provider: 'azure-deepseek',
         model,
@@ -382,38 +398,38 @@ describe('createAzureDeepseekModel', () => {
       expectMissingSetting(
         createAzureDeepseekModel,
         cfg,
-        'OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL',
+        'AZURE_DEEPSEEK_MODEL',
       );
     });
   }
 
-  it('throws UsageError when cfg.model disagrees with OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL', () => {
+  it('throws UsageError when cfg.model disagrees with AZURE_DEEPSEEK_MODEL', () => {
     const cfg = makeCfg({
       provider: 'azure-deepseek',
       model: 'DeepSeek-V3.2',
       providerEnv: freezeEnv({
         ...baseEnv,
-        OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL: 'DeepSeek-V3.1',
+        AZURE_DEEPSEEK_MODEL: 'DeepSeek-V3.1',
       }),
     });
     expect(() => createAzureDeepseekModel(cfg)).toThrow(UsageError);
   });
 
-  it('constructs when cfg.model agrees with OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL', () => {
+  it('constructs when cfg.model agrees with AZURE_DEEPSEEK_MODEL', () => {
     const cfg = makeCfg({
       provider: 'azure-deepseek',
       model: 'DeepSeek-V3.2',
       providerEnv: freezeEnv({
         ...baseEnv,
-        OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL: 'DeepSeek-V3.2',
+        AZURE_DEEPSEEK_MODEL: 'DeepSeek-V3.2',
       }),
     });
     expect(() => createAzureDeepseekModel(cfg)).not.toThrow();
   });
 
   for (const key of [
-    'OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT',
-    'OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY',
+    'AZURE_AI_INFERENCE_ENDPOINT',
+    'AZURE_AI_INFERENCE_KEY',
   ] as const) {
     it(`throws ConfigurationError(${key}) when missing`, () => {
       const partial = { ...baseEnv } as Record<string, string>;
@@ -433,7 +449,7 @@ describe('createAzureDeepseekModel', () => {
       model: 'DeepSeek-V3.2',
       providerEnv: freezeEnv({
         ...baseEnv,
-        OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT:
+        AZURE_AI_INFERENCE_ENDPOINT:
           'https://resource.services.ai.azure.com/',
       }),
     });
@@ -446,7 +462,7 @@ describe('createAzureDeepseekModel', () => {
       model: 'DeepSeek-V3.2',
       providerEnv: freezeEnv({
         ...baseEnv,
-        OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT:
+        AZURE_AI_INFERENCE_ENDPOINT:
           'https://resource.services.ai.azure.com/models',
       }),
     });
@@ -455,11 +471,98 @@ describe('createAzureDeepseekModel', () => {
 });
 
 // ---------------------------------------------------------------------------
+// local-openai
+// ---------------------------------------------------------------------------
+
+describe('createLocalOpenaiModel', () => {
+  it('constructs ChatOpenAI with OPENAI_BASE_URL', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        OPENAI_BASE_URL: 'http://localhost:11434/v1',
+      }),
+    });
+    const m = createLocalOpenaiModel(cfg);
+    expect(m).toBeInstanceOf(ChatOpenAI);
+    expect(m.constructor.name).toBe('ChatOpenAI');
+  });
+
+  it('constructs with LOCAL_OPENAI_BASE_URL when OPENAI_BASE_URL is absent', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        LOCAL_OPENAI_BASE_URL: 'http://localhost:8080/v1',
+      }),
+    });
+    expect(() => createLocalOpenaiModel(cfg)).not.toThrow();
+  });
+
+  it('constructs with OLLAMA_HOST and maps to http://<host>/v1', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        OLLAMA_HOST: 'localhost:11434',
+      }),
+    });
+    expect(() => createLocalOpenaiModel(cfg)).not.toThrow();
+  });
+
+  it('uses OPENAI_API_KEY when provided', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        OPENAI_BASE_URL: 'http://localhost:11434/v1',
+        OPENAI_API_KEY: 'real-key',
+      }),
+    });
+    expect(() => createLocalOpenaiModel(cfg)).not.toThrow();
+  });
+
+  it('defaults to sentinel key "not-needed" when OPENAI_API_KEY is absent', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        OPENAI_BASE_URL: 'http://localhost:11434/v1',
+      }),
+    });
+    // Should not throw even without an API key.
+    expect(() => createLocalOpenaiModel(cfg)).not.toThrow();
+  });
+
+  it('throws ConfigurationError(OPENAI_BASE_URL) when no base URL is resolvable', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({}),
+    });
+    expectMissingSetting(createLocalOpenaiModel, cfg, 'OPENAI_BASE_URL');
+  });
+
+  it('OPENAI_BASE_URL takes priority over LOCAL_OPENAI_BASE_URL', () => {
+    const cfg = makeCfg({
+      provider: 'local-openai',
+      model: 'llama-3.2',
+      providerEnv: freezeEnv({
+        OPENAI_BASE_URL: 'http://primary:11434/v1',
+        LOCAL_OPENAI_BASE_URL: 'http://secondary:8080/v1',
+      }),
+    });
+    // Both present — should use OPENAI_BASE_URL without error.
+    expect(() => createLocalOpenaiModel(cfg)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
 describe('PROVIDERS registry', () => {
-  it('has exactly six entries, one per ProviderName literal', () => {
+  it('has seven entries (six canonical + azure-deepseek extension)', () => {
     const names = Object.keys(PROVIDERS).sort();
     expect(names).toEqual(
       [
@@ -467,7 +570,8 @@ describe('PROVIDERS registry', () => {
         'azure-anthropic',
         'azure-deepseek',
         'azure-openai',
-        'google',
+        'gemini',
+        'local-openai',
         'openai',
       ].sort(),
     );
@@ -484,9 +588,10 @@ describe('PROVIDERS registry', () => {
   it('getProvider returns the matching factory for each known name', () => {
     expect(getProvider('openai')).toBe(createOpenaiModel);
     expect(getProvider('anthropic')).toBe(createAnthropicModel);
-    expect(getProvider('google')).toBe(createGoogleModel);
+    expect(getProvider('gemini')).toBe(createGeminiModel);
     expect(getProvider('azure-openai')).toBe(createAzureOpenaiModel);
     expect(getProvider('azure-anthropic')).toBe(createAzureAnthropicModel);
+    expect(getProvider('local-openai')).toBe(createLocalOpenaiModel);
     expect(getProvider('azure-deepseek')).toBe(createAzureDeepseekModel);
   });
 

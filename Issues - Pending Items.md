@@ -4,6 +4,22 @@
 
 <!-- Most critical / highest priority first. -->
 
+### 2. configuration-guide.md needs refresh for v2.0.0 standard env var names
+
+**Status:** pending (2026-04-24, after v2.0.0 provider rename landed).
+
+**Context:** `docs/design/configuration-guide.md` still documents
+the old `OUTLOOK_AGENT_OPENAI_API_KEY`-style names. It should be updated
+to document the new standard names (`OPENAI_API_KEY`, etc.), the new
+`local-openai` provider, the `gemini` provider (and `google` deprecation),
+the extended precedence chain including `~/tool-agents/outlook-cli/`,
+and the new `--base-url` / `--config` flags.
+
+**Action required:** refresh `docs/design/configuration-guide.md` and
+`docs/design/project-design.md §4–5` with the v2.0.0 provider/env table.
+
+**Effort:** low (documentation only).
+
 ### 1. `/monitor` slash command is stubbed — rich monitoring not implemented
 
 **Status:** pending (2026-04-23, after plan-004 Agent TUI landed).

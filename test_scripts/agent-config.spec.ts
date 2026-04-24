@@ -4,8 +4,12 @@
 // precedence, mandatory-field enforcement, optional-field defaults,
 // and the providerEnv snapshot.
 //
+// v2.0.0: credential env vars use standard vendor-documented names.
+// The `google` provider is deprecated → `gemini`. `local-openai` is new.
+//
 // Pure-logic: no dotenv loading (the caller does that), no network,
-// no browser.
+// no browser. The ~/tool-agents folder is seeded on each loadAgentConfig
+// call; tests use a tmpdir to avoid polluting the real home dir.
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -19,6 +23,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 
 import {
@@ -29,27 +34,59 @@ import { UsageError } from '../src/commands/list-mail';
 import { ConfigurationError } from '../src/config/errors';
 
 // ---------------------------------------------------------------------------
-// Env-var hygiene: clear every OUTLOOK_AGENT_* key in beforeEach; restore
-// originals in afterAll. We mutate process.env directly — do NOT replace it.
+// Env-var hygiene: clear OUTLOOK_AGENT_* and the new standard credential
+// vars before each test; restore originals in afterAll.
 // ---------------------------------------------------------------------------
 
-const ENV_PREFIX = 'OUTLOOK_AGENT_';
+const AGENT_ENV_PREFIX = 'OUTLOOK_AGENT_';
+// Standard credential vars that the new providers read directly.
+const STANDARD_CRED_VARS = [
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'OPENAI_ORG_ID',
+  'LOCAL_OPENAI_BASE_URL',
+  'OLLAMA_HOST',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_BASE_URL',
+  'GOOGLE_API_KEY',
+  'GEMINI_API_KEY',
+  'AZURE_OPENAI_API_KEY',
+  'AZURE_OPENAI_ENDPOINT',
+  'AZURE_OPENAI_DEPLOYMENT',
+  'AZURE_OPENAI_API_VERSION',
+  'AZURE_AI_INFERENCE_KEY',
+  'AZURE_AI_INFERENCE_ENDPOINT',
+  'AZURE_ANTHROPIC_MODEL',
+  'AZURE_DEEPSEEK_MODEL',
+];
+
 let savedEnv: Record<string, string | undefined> = {};
+
+// Isolated fake HOME so loadAgentConfig's ensureAgentConfigFolder step
+// never reads the real `~/.tool-agents/outlook-cli/.env`. Without this,
+// a developer's edits (e.g. uncommented AZURE_OPENAI_DEPLOYMENT) leak
+// into the test process via dotenv's override:false injection.
+let fakeHome: string;
+let realHome: string | undefined;
 
 function clearAgentEnv(): void {
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith(ENV_PREFIX)) {
+    if (key.startsWith(AGENT_ENV_PREFIX)) {
       delete process.env[key];
     }
+  }
+  for (const key of STANDARD_CRED_VARS) {
+    delete process.env[key];
   }
 }
 
 beforeAll(() => {
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith(ENV_PREFIX)) {
-      savedEnv[k] = v;
-    }
+  for (const key of [...Object.keys(process.env).filter(k => k.startsWith(AGENT_ENV_PREFIX)), ...STANDARD_CRED_VARS]) {
+    savedEnv[key] = process.env[key];
   }
+  fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-config-home-'));
+  realHome = process.env.HOME;
+  process.env.HOME = fakeHome;
 });
 
 beforeEach(() => {
@@ -61,12 +98,21 @@ afterEach(() => {
 });
 
 afterAll(() => {
-  // Restore whatever was there at module load.
   clearAgentEnv();
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v !== undefined) {
       process.env[k] = v;
     }
+  }
+  if (realHome === undefined) {
+    delete process.env.HOME;
+  } else {
+    process.env.HOME = realHome;
+  }
+  try {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+  } catch {
+    // ignore
   }
 });
 
@@ -123,6 +169,35 @@ describe('loadAgentConfig — required provider', () => {
     const cfg = loadAgentConfig({ provider: 'openai', model: 'gpt-4o-mini' });
     expect(cfg.provider).toBe('openai');
   });
+
+  it('accepts gemini as a valid provider', () => {
+    const cfg = loadAgentConfig({ provider: 'gemini', model: 'gemini-2.5-pro' });
+    expect(cfg.provider).toBe('gemini');
+  });
+
+  it('accepts local-openai as a valid provider', () => {
+    const cfg = loadAgentConfig({ provider: 'local-openai', model: 'llama-3.2' });
+    expect(cfg.provider).toBe('local-openai');
+  });
+
+  it('normalises deprecated google → gemini with a deprecation warning', () => {
+    const stderrWrites: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    });
+    try {
+      const cfg = loadAgentConfig({ provider: 'google', model: 'gemini-2.5-pro' });
+      expect(cfg.provider).toBe('gemini');
+      const warning = stderrWrites.join('');
+      expect(warning).toContain('DEPRECATION WARNING');
+      expect(warning).toContain('google');
+      expect(warning).toContain('gemini');
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -158,27 +233,27 @@ describe('loadAgentConfig — required model', () => {
     }
   });
 
-  it('azure-openai falls back to OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT when OUTLOOK_AGENT_MODEL is unset', () => {
-    process.env.OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT = 'my-gpt-4o-deployment';
+  it('azure-openai falls back to AZURE_OPENAI_DEPLOYMENT when OUTLOOK_AGENT_MODEL is unset', () => {
+    process.env.AZURE_OPENAI_DEPLOYMENT = 'my-gpt-4o-deployment';
     const cfg = loadAgentConfig({ provider: 'azure-openai' });
     expect(cfg.model).toBe('my-gpt-4o-deployment');
   });
 
   it('azure-openai: OUTLOOK_AGENT_MODEL still wins over the DEPLOYMENT fallback', () => {
     process.env.OUTLOOK_AGENT_MODEL = 'explicit-model';
-    process.env.OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT = 'ignored-deployment';
+    process.env.AZURE_OPENAI_DEPLOYMENT = 'ignored-deployment';
     const cfg = loadAgentConfig({ provider: 'azure-openai' });
     expect(cfg.model).toBe('explicit-model');
   });
 
-  it('azure-anthropic falls back to OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL', () => {
-    process.env.OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
+  it('azure-anthropic falls back to AZURE_ANTHROPIC_MODEL', () => {
+    process.env.AZURE_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
     const cfg = loadAgentConfig({ provider: 'azure-anthropic' });
     expect(cfg.model).toBe('claude-sonnet-4-5');
   });
 
-  it('azure-deepseek falls back to OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL', () => {
-    process.env.OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL = 'DeepSeek-V3.2';
+  it('azure-deepseek falls back to AZURE_DEEPSEEK_MODEL', () => {
+    process.env.AZURE_DEEPSEEK_MODEL = 'DeepSeek-V3.2';
     const cfg = loadAgentConfig({ provider: 'azure-deepseek' });
     expect(cfg.model).toBe('DeepSeek-V3.2');
   });
@@ -191,7 +266,7 @@ describe('loadAgentConfig — required model', () => {
       expect(err).toBeInstanceOf(ConfigurationError);
       const e = err as ConfigurationError;
       expect(e.missingSetting).toBe('OUTLOOK_AGENT_MODEL');
-      expect(e.checkedSources).toContain('OUTLOOK_AGENT_AZURE_OPENAI_DEPLOYMENT');
+      expect(e.checkedSources).toContain('AZURE_OPENAI_DEPLOYMENT');
     }
   });
 });
@@ -494,26 +569,24 @@ describe('loadAgentConfig — envFile', () => {
 });
 
 // ---------------------------------------------------------------------------
-// providerEnv snapshot
+// providerEnv snapshot — now uses standard env var names
 // ---------------------------------------------------------------------------
 
-describe('loadAgentConfig — providerEnv snapshot', () => {
-  it('includes OUTLOOK_AGENT_OPENAI_* when provider is openai', () => {
-    process.env.OUTLOOK_AGENT_OPENAI_API_KEY = 'sk-xxx';
-    process.env.OUTLOOK_AGENT_OPENAI_BASE_URL = 'https://proxy.example.com';
+describe('loadAgentConfig — providerEnv snapshot (standard names)', () => {
+  it('includes OPENAI_* when provider is openai', () => {
+    process.env.OPENAI_API_KEY = 'sk-xxx';
+    process.env.OPENAI_BASE_URL = 'https://proxy.example.com';
     const cfg = loadAgentConfig(withRequired({ provider: 'openai' }));
-    expect(cfg.providerEnv.OUTLOOK_AGENT_OPENAI_API_KEY).toBe('sk-xxx');
-    expect(cfg.providerEnv.OUTLOOK_AGENT_OPENAI_BASE_URL).toBe(
-      'https://proxy.example.com',
-    );
+    expect(cfg.providerEnv.OPENAI_API_KEY).toBe('sk-xxx');
+    expect(cfg.providerEnv.OPENAI_BASE_URL).toBe('https://proxy.example.com');
   });
 
-  it('does not include other providers’ env vars', () => {
-    process.env.OUTLOOK_AGENT_OPENAI_API_KEY = 'sk-xxx';
+  it('does not include other providers env vars in snapshot', () => {
+    process.env.OPENAI_API_KEY = 'sk-xxx';
     const cfg = loadAgentConfig(
       withRequired({ provider: 'anthropic', model: 'claude-x' }),
     );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_OPENAI_API_KEY).toBeUndefined();
+    expect(cfg.providerEnv.OPENAI_API_KEY).toBeUndefined();
   });
 
   it('is frozen', () => {
@@ -521,54 +594,127 @@ describe('loadAgentConfig — providerEnv snapshot', () => {
     expect(Object.isFrozen(cfg.providerEnv)).toBe(true);
   });
 
-  it('omits unset keys (no undefined values)', () => {
+  it('omits unset keys (no undefined values in snapshot)', () => {
     const cfg = loadAgentConfig(withRequired({ provider: 'openai' }));
-    // No OPENAI_* vars set → snapshot must be empty, NOT contain undefineds.
-    expect(Object.keys(cfg.providerEnv)).toHaveLength(0);
+    // No OPENAI_* vars set → snapshot must be empty (or contain only
+    // OPENAI_BASE_URL if --base-url was passed, but here nothing was).
+    for (const v of Object.values(cfg.providerEnv)) {
+      expect(v).not.toBeUndefined();
+    }
   });
 
-  it('azure-deepseek snapshot includes both AZURE_DEEPSEEK_* and AZURE_AI_INFERENCE_*', () => {
-    process.env.OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL = 'DeepSeek-V3.2';
-    process.env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY = 'foundry-key';
-    process.env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT =
+  it('azure-deepseek snapshot includes AZURE_DEEPSEEK_* and AZURE_AI_INFERENCE_*', () => {
+    process.env.AZURE_DEEPSEEK_MODEL = 'DeepSeek-V3.2';
+    process.env.AZURE_AI_INFERENCE_KEY = 'foundry-key';
+    process.env.AZURE_AI_INFERENCE_ENDPOINT =
       'https://res.services.ai.azure.com';
     const cfg = loadAgentConfig(
       withRequired({ provider: 'azure-deepseek', model: 'DeepSeek-V3.2' }),
     );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL).toBe(
-      'DeepSeek-V3.2',
-    );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY).toBe(
-      'foundry-key',
-    );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_AZURE_AI_INFERENCE_ENDPOINT).toBe(
+    expect(cfg.providerEnv.AZURE_DEEPSEEK_MODEL).toBe('DeepSeek-V3.2');
+    expect(cfg.providerEnv.AZURE_AI_INFERENCE_KEY).toBe('foundry-key');
+    expect(cfg.providerEnv.AZURE_AI_INFERENCE_ENDPOINT).toBe(
       'https://res.services.ai.azure.com',
     );
   });
 
-  it('azure-anthropic snapshot also includes the shared inference block', () => {
-    process.env.OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
-    process.env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY = 'foundry-key';
+  it('azure-anthropic snapshot includes AZURE_ANTHROPIC_* and AZURE_AI_INFERENCE_*', () => {
+    process.env.AZURE_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
+    process.env.AZURE_AI_INFERENCE_KEY = 'foundry-key';
     const cfg = loadAgentConfig(
       withRequired({
         provider: 'azure-anthropic',
         model: 'claude-sonnet-4-5',
       }),
     );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL).toBe(
-      'claude-sonnet-4-5',
-    );
-    expect(cfg.providerEnv.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY).toBe(
-      'foundry-key',
-    );
+    expect(cfg.providerEnv.AZURE_ANTHROPIC_MODEL).toBe('claude-sonnet-4-5');
+    expect(cfg.providerEnv.AZURE_AI_INFERENCE_KEY).toBe('foundry-key');
   });
 
   it('openai snapshot does NOT include AZURE_AI_INFERENCE_* block', () => {
-    process.env.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY = 'foundry-key';
+    process.env.AZURE_AI_INFERENCE_KEY = 'foundry-key';
     const cfg = loadAgentConfig(withRequired({ provider: 'openai' }));
-    expect(
-      cfg.providerEnv.OUTLOOK_AGENT_AZURE_AI_INFERENCE_KEY,
-    ).toBeUndefined();
+    expect(cfg.providerEnv.AZURE_AI_INFERENCE_KEY).toBeUndefined();
+  });
+
+  it('gemini snapshot includes GOOGLE_API_KEY and GEMINI_API_KEY', () => {
+    process.env.GOOGLE_API_KEY = 'gkey';
+    process.env.GEMINI_API_KEY = 'gkey2';
+    const cfg = loadAgentConfig(withRequired({ provider: 'gemini' }));
+    expect(cfg.providerEnv.GOOGLE_API_KEY).toBe('gkey');
+    expect(cfg.providerEnv.GEMINI_API_KEY).toBe('gkey2');
+  });
+
+  it('local-openai snapshot includes OPENAI_BASE_URL and OLLAMA_HOST', () => {
+    process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1';
+    process.env.OLLAMA_HOST = 'localhost:11434';
+    const cfg = loadAgentConfig(withRequired({ provider: 'local-openai' }));
+    expect(cfg.providerEnv.OPENAI_BASE_URL).toBe('http://localhost:11434/v1');
+    expect(cfg.providerEnv.OLLAMA_HOST).toBe('localhost:11434');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --base-url flag (R2)
+// ---------------------------------------------------------------------------
+
+describe('loadAgentConfig — baseUrl flag', () => {
+  it('injects OPENAI_BASE_URL into openai providerEnv when --base-url is set', () => {
+    const cfg = loadAgentConfig(withRequired({
+      provider: 'openai',
+      baseUrl: 'https://proxy.corp.com/v1',
+    }));
+    expect(cfg.providerEnv.OPENAI_BASE_URL).toBe('https://proxy.corp.com/v1');
+  });
+
+  it('injects OPENAI_BASE_URL into local-openai providerEnv when --base-url is set', () => {
+    const cfg = loadAgentConfig(withRequired({
+      provider: 'local-openai',
+      baseUrl: 'http://localhost:11434/v1',
+    }));
+    expect(cfg.providerEnv.OPENAI_BASE_URL).toBe('http://localhost:11434/v1');
+  });
+
+  it('does not inject base-url for anthropic provider', () => {
+    const cfg = loadAgentConfig(withRequired({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-5',
+      baseUrl: 'https://ignored.example.com',
+    }));
+    // anthropic provider uses ANTHROPIC_BASE_URL, not OPENAI_BASE_URL
+    expect(cfg.providerEnv.OPENAI_BASE_URL).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --config flag (R3)
+// ---------------------------------------------------------------------------
+
+describe('loadAgentConfig — configPath flag', () => {
+  let tmpDir: string;
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-config-cfgpath-'));
+  });
+
+  afterAll(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('accepts --config pointing at a valid config.json with schemaVersion 1', () => {
+    const cfgFile = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({ schemaVersion: 1, maxSteps: 7 }), { mode: 0o600 });
+    const cfg = loadAgentConfig(withRequired({ configPath: cfgFile }));
+    // maxSteps from config.json should be used (env not set, flag not set).
+    expect(cfg.maxSteps).toBe(7);
+  });
+
+  it('ignores config.json with wrong schemaVersion (warns, uses defaults)', () => {
+    const cfgFile = path.join(tmpDir, 'config-bad-version.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({ schemaVersion: 99, maxSteps: 999 }), { mode: 0o600 });
+    const cfg = loadAgentConfig(withRequired({ configPath: cfgFile }));
+    // schemaVersion 99 → rejected, so maxSteps falls back to default 10.
+    expect(cfg.maxSteps).toBe(10);
   });
 });
 

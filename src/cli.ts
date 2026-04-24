@@ -960,7 +960,7 @@ export async function main(argv: string[]): Promise<number> {
     )
     .option(
       '-p, --provider <name>',
-      'LLM provider (openai, anthropic, google, azure-openai, azure-anthropic, azure-deepseek). Falls back to OUTLOOK_AGENT_PROVIDER.',
+      'LLM provider (openai, anthropic, gemini, azure-openai, azure-anthropic, local-openai, azure-deepseek). Falls back to OUTLOOK_AGENT_PROVIDER.',
     )
     .option(
       '-m, --model <id>',
@@ -1000,6 +1000,14 @@ export async function main(argv: string[]): Promise<number> {
       '--agent-model-file <path>',
       'Path to the saved-model JSON file (default $HOME/.outlook-cli/agent-model.json)',
     )
+    .option(
+      '--base-url <url>',
+      'Override the LLM provider base URL (useful for local-openai / proxy endpoints)',
+    )
+    .option(
+      '--config <path>',
+      'Override ~/.tool-agents/outlook-cli/config.json path',
+    )
     .option('--verbose', 'Emit per-step trace to stderr', false)
     .action(
       makeAction<
@@ -1017,6 +1025,8 @@ export async function main(argv: string[]): Promise<number> {
           envFile?: string;
           agentMemoryFile?: string;
           agentModelFile?: string;
+          baseUrl?: string;
+          config?: string;
           verbose?: boolean;
         },
         [string | undefined]
@@ -1035,6 +1045,8 @@ export async function main(argv: string[]): Promise<number> {
           envFile: cmdOpts.envFile,
           agentMemoryFile: cmdOpts.agentMemoryFile,
           agentModelFile: cmdOpts.agentModelFile,
+          baseUrl: cmdOpts.baseUrl,
+          configPath: cmdOpts.config,
           verbose: cmdOpts.verbose ?? false,
           logFile: g.logFile,
           noAutoReauth: g.autoReauth === false,

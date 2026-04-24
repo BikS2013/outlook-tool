@@ -437,10 +437,14 @@ lands in `src/config/agent-config.ts` alongside the existing helpers; the
         - `-i, --interactive`            Start a REPL. Mutually tolerated
                                          with a positional prompt (prompt
                                          is ignored with a stderr note).
-        - `-p, --provider <name>`        `openai | anthropic | google |
+        - `-p, --provider <name>`        `openai | anthropic | gemini |
                                          azure-openai | azure-anthropic |
-                                         azure-deepseek`. Env:
+                                         local-openai | azure-deepseek`. Env:
                                          `OUTLOOK_AGENT_PROVIDER`. MANDATORY.
+                                         Note: `google` accepted as deprecated
+                                         alias for `gemini`.
+                                         Note: `azure-deepseek` is a project-
+                                         extension, not in the canonical 6.
         - `-m, --model <id>`             Model id or Azure deployment name.
                                          Env: `OUTLOOK_AGENT_MODEL`. MANDATORY.
         - `--max-steps <n>`              Max ReAct iterations (positive int).
@@ -474,6 +478,12 @@ lands in `src/config/agent-config.ts` alongside the existing helpers; the
                                          dotenv passes `override: false`.
                                          Without the flag, the agent still
                                          loads `./.env` if present.
+        - `--base-url <url>`             Override the LLM provider base URL.
+                                         For `openai` and `local-openai`,
+                                         injected as `OPENAI_BASE_URL` into
+                                         the providerEnv snapshot.
+        - `--config <path>`              Override `~/.tool-agents/outlook-cli/
+                                         config.json` path (file or folder).
         - `--verbose`                    Emit per-step trace to stderr.
 
         Global flags from the top-level CLI (`--log-file`, `--no-auto-reauth`,
@@ -491,20 +501,31 @@ lands in `src/config/agent-config.ts` alongside the existing helpers; the
           5  upstream error (surfaced by tool adapters)
           6  IO error (session write, `download_attachments` collisions)
 
-        Providers → env var prefixes:
+        Providers → standard credential env vars (v2.0.0+):
 
         ```
-        openai            OUTLOOK_AGENT_OPENAI_*            _API_KEY (req), _BASE_URL, _ORG
-        anthropic         OUTLOOK_AGENT_ANTHROPIC_*         _API_KEY (req), _BASE_URL
-        google            OUTLOOK_AGENT_GOOGLE_*            _API_KEY (req)
-        azure-openai      OUTLOOK_AGENT_AZURE_OPENAI_*      _API_KEY, _ENDPOINT, _API_VERSION,
-                                                            _DEPLOYMENT (all required)
-        azure-anthropic   OUTLOOK_AGENT_AZURE_AI_INFERENCE_ _KEY, _ENDPOINT (both req), +
-                          OUTLOOK_AGENT_AZURE_ANTHROPIC_MODEL (optional)
-        azure-deepseek    OUTLOOK_AGENT_AZURE_AI_INFERENCE_ _KEY, _ENDPOINT (both req), +
-                          OUTLOOK_AGENT_AZURE_DEEPSEEK_MODEL (optional; denylisted models
-                          rejected at config load)
+        openai            OPENAI_API_KEY (req), OPENAI_BASE_URL, OPENAI_ORG_ID
+        anthropic         ANTHROPIC_API_KEY (req), ANTHROPIC_BASE_URL
+        gemini            GOOGLE_API_KEY (req) or GEMINI_API_KEY (alias)
+          (deprecated: 'google' is accepted but normalised to 'gemini' + warning)
+        azure-openai      AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
+                          AZURE_OPENAI_DEPLOYMENT (all req), AZURE_OPENAI_API_VERSION
+        azure-anthropic   AZURE_AI_INFERENCE_KEY, AZURE_AI_INFERENCE_ENDPOINT (both req),
+                          AZURE_ANTHROPIC_MODEL (optional)
+        local-openai      OPENAI_BASE_URL | LOCAL_OPENAI_BASE_URL | OLLAMA_HOST (one req,
+                          OLLAMA_HOST mapped to http://<host>/v1), OPENAI_API_KEY (opt)
+        azure-deepseek    AZURE_AI_INFERENCE_KEY, AZURE_AI_INFERENCE_ENDPOINT (both req),
+                          AZURE_DEEPSEEK_MODEL (opt; denylisted models rejected at config load)
+                          NOTE: azure-deepseek is a project-extension, NOT in the canonical
+                          6-slot standard set.
         ```
+
+        Control vars (OUTLOOK_AGENT_* prefix — NOT renamed):
+          OUTLOOK_AGENT_PROVIDER, OUTLOOK_AGENT_MODEL, OUTLOOK_AGENT_MAX_STEPS,
+          OUTLOOK_AGENT_TEMPERATURE, OUTLOOK_AGENT_SYSTEM_PROMPT,
+          OUTLOOK_AGENT_SYSTEM_PROMPT_FILE, OUTLOOK_AGENT_TOOLS,
+          OUTLOOK_AGENT_PER_TOOL_BUDGET_BYTES, OUTLOOK_AGENT_TOOL_OUTPUT_BUDGET_BYTES,
+          OUTLOOK_AGENT_ALLOW_MUTATIONS, OUTLOOK_AGENT_MEMORY_FILE, OUTLOOK_AGENT_MODEL_FILE.
 
         Exposed LLM tools:
           Read-only (always on): `auth_check`, `list_mail`, `get_mail`,
@@ -513,9 +534,22 @@ lands in `src/config/agent-config.ts` alongside the existing helpers; the
           Mutating (`--allow-mutations` required): `create_folder`,
             `move_mail`, `download_attachments`.
 
-        `.env` precedence: CLI flag > process env > `.env` file > default
-        (optional rows only). Mandatory rows raise `ConfigurationError`
-        (exit 3) when unresolved.
+        Configuration precedence chain (v2.1.0+ — folder .env overrides shell):
+          CLI flag > ~/.tool-agents/outlook-cli/.env > process env
+          > cwd/.env (--env-file) > ~/.tool-agents/outlook-cli/config.json
+          > default (optional) / throw.
+
+        This is a project-specific reversal of the cli-agent-builder canonical
+        "shell-wins" precedence. The per-user folder holds durable, intentional
+        config; a stale shell export from another project must not shadow it.
+        CLI flags still win over everything. Dotenv is called with
+        `override: true` on the folder .env only.
+
+        ~/.tool-agents/outlook-cli/ folder (created on first agent run):
+          config.json  — non-secret runtime defaults (mode 0600, schemaVersion 1)
+          .env         — secrets (mode 0600, all vars commented on seed —
+                          uncomment the lines you need)
+          The folder itself is mode 0700.
 
         Examples:
 

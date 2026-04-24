@@ -25,9 +25,10 @@ const FILE_VERSION = 1 as const;
 const VALID_PROVIDERS: readonly ProviderName[] = [
   "openai",
   "anthropic",
-  "google",
+  "gemini",
   "azure-openai",
   "azure-anthropic",
+  "local-openai",
   "azure-deepseek",
 ] as const;
 

@@ -2,6 +2,11 @@
 //
 // Factory for the `openai` provider (native OpenAI API via @langchain/openai).
 // Normative spec: docs/design/project-design.md §5.1.
+//
+// Standard env vars (v2.0.0+):
+//   OPENAI_API_KEY   — required
+//   OPENAI_BASE_URL  — optional (proxy / gateway override)
+//   OPENAI_ORG_ID    — optional
 
 import { ChatOpenAI } from '@langchain/openai';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
@@ -10,15 +15,15 @@ import { ConfigurationError } from '../../config/errors';
 import type { AgentConfig } from '../../config/agent-config';
 import type { ProviderFactory } from './types';
 
-const ENV_API_KEY = 'OUTLOOK_AGENT_OPENAI_API_KEY';
-const ENV_BASE_URL = 'OUTLOOK_AGENT_OPENAI_BASE_URL';
-const ENV_ORG = 'OUTLOOK_AGENT_OPENAI_ORG';
+const ENV_API_KEY = 'OPENAI_API_KEY';
+const ENV_BASE_URL = 'OPENAI_BASE_URL';
+const ENV_ORG = 'OPENAI_ORG_ID';
 
 /**
  * Construct a `ChatOpenAI` from the provider-env snapshot.
  *
- * Required: OUTLOOK_AGENT_OPENAI_API_KEY.
- * Optional: OUTLOOK_AGENT_OPENAI_BASE_URL, OUTLOOK_AGENT_OPENAI_ORG.
+ * Required: OPENAI_API_KEY.
+ * Optional: OPENAI_BASE_URL, OPENAI_ORG_ID.
  */
 export const createOpenaiModel: ProviderFactory = (
   cfg: AgentConfig,
@@ -27,7 +32,11 @@ export const createOpenaiModel: ProviderFactory = (
 
   const apiKey = env[ENV_API_KEY];
   if (apiKey === undefined || apiKey === '') {
-    throw new ConfigurationError(ENV_API_KEY, [ENV_API_KEY, '.env']);
+    throw new ConfigurationError(ENV_API_KEY, [
+      ENV_API_KEY,
+      '~/.tool-agents/outlook-cli/.env',
+      '~/.tool-agents/outlook-cli/config.json',
+    ]);
   }
 
   const baseURL = env[ENV_BASE_URL];

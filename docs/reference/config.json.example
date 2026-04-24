@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+
+  "_comment": "Place this file at ~/.tool-agents/outlook-cli/config.json. Non-secret runtime defaults only. Secrets (API keys) belong in ~/.tool-agents/outlook-cli/.env (mode 0600). This file is mode 0600.",
+
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "maxSteps": 10,
+  "temperature": 0,
+  "perToolBudgetBytes": 16384,
+  "allowMutations": false,
+
+  "_providerNote": "Supported providers: openai | anthropic | gemini | azure-openai | azure-anthropic | local-openai | azure-deepseek (extension)",
+
+  "_expiryNote": "Add apiKeyExpiresAt / azureKeyExpiresAt / expiresAt (ISO 8601) to get a warning on startup when within 7 days of expiry.",
+  "apiKeyExpiresAt": "YYYY-MM-DD",
+  "azureKeyExpiresAt": "YYYY-MM-DD",
+
+  "_openaiNote": "OPENAI_API_KEY must be in .env, not here. Optionally set base URL and org here if not using shell env vars.",
+
+  "_anthropicNote": "ANTHROPIC_API_KEY must be in .env.",
+
+  "_geminiNote": "GOOGLE_API_KEY or GEMINI_API_KEY must be in .env.",
+
+  "_azureOpenaiNote": "AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT must be in .env. AZURE_OPENAI_API_VERSION is optional.",
+
+  "_azureAnthropicNote": "AZURE_AI_INFERENCE_KEY, AZURE_AI_INFERENCE_ENDPOINT must be in .env.",
+
+  "_localOpenaiNote": "OPENAI_BASE_URL, LOCAL_OPENAI_BASE_URL, or OLLAMA_HOST must be set (env or .env). No API key required (defaults to 'not-needed').",
+
+  "_azureDeepseekNote": "azure-deepseek is a project extension (not in the canonical 6-slot standard). AZURE_AI_INFERENCE_KEY and AZURE_AI_INFERENCE_ENDPOINT must be in .env."
+}
