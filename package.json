@@ -1,6 +1,6 @@
 {
-  "name": "@biks2013/outlook-tool",
-  "version": "3.1.0",
+  "name": "@biks2013/outlook-cli",
+  "version": "3.1.1",
   "description": "CLI for Outlook web — authenticate via Playwright, manage inbox, calendar, folders, and attachments through the Outlook REST v2.0 API.",
   "main": "dist/cli.js",
   "bin": {
@@ -32,7 +32,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/BikS2013/outlook-tool.git"
+    "url": "git+https://github.com/BikS2013/outlook-tool.git"
   },
   "bugs": {
     "url": "https://github.com/BikS2013/outlook-tool/issues"
@@ -48,13 +48,13 @@
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@types/node": "^25.6.0",
-    "playwright": "^1.59.1",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.4"
   },
   "dependencies": {
     "commander": "^14.0.3",
-    "dotenv": "^17.0.0"
+    "dotenv": "^17.0.0",
+    "playwright": "^1.59.1"
   }
 }

@@ -8,6 +8,26 @@ Dates are ISO8601 (local calendar day).
 
 ---
 
+## [3.1.1] — 2026-04-30
+
+### Fixed — `playwright` moved to `dependencies` (was in `devDependencies`)
+
+The `login` command and the silent re-auth path both
+`import { chromium } from 'playwright'` at runtime, but the package
+was declared as a dev-only dependency. That worked for `npm install`
+inside this repo, but `npm install -g @biks2013/outlook-cli` (and
+similar global / production installs) skipped dev deps, so the first
+run of `outlook-cli login` failed with `Cannot find module 'playwright'`.
+
+`playwright@^1.59.1` is now in `dependencies`. `@playwright/test`
+remains in `devDependencies` (it's only used by the local test
+runner, not at runtime).
+
+Adds ~50 MB to global-install footprint; required for the
+out-of-the-box experience.
+
+---
+
 ## [3.1.0] — 2026-04-30
 
 ### Changed — runtime data location consolidated under `~/.tool-agents/outlook-cli/`
