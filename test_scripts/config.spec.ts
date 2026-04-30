@@ -148,13 +148,17 @@ describe('loadConfig', () => {
 
     const cfg = loadConfig({});
     expect(typeof cfg.sessionFilePath).toBe('string');
-    expect(cfg.sessionFilePath.endsWith('/.outlook-cli/session.json')).toBe(
-      true,
-    );
+    expect(
+      cfg.sessionFilePath.endsWith(
+        '/.tool-agents/outlook-cli/session.json',
+      ),
+    ).toBe(true);
     expect(typeof cfg.profileDir).toBe('string');
-    expect(cfg.profileDir.endsWith('/.outlook-cli/playwright-profile')).toBe(
-      true,
-    );
+    expect(
+      cfg.profileDir.endsWith(
+        '/.tool-agents/outlook-cli/playwright-profile',
+      ),
+    ).toBe(true);
     expect(typeof cfg.tz).toBe('string');
     expect(cfg.tz.length).toBeGreaterThan(0);
     expect(cfg.outputMode).toBe('json');

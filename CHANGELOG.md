@@ -8,6 +8,135 @@ Dates are ISO8601 (local calendar day).
 
 ---
 
+## [3.1.0] — 2026-04-30
+
+### Changed — runtime data location consolidated under `~/.tool-agents/outlook-cli/`
+
+Per the project tool-conventions, all runtime data the CLI writes now
+lives under the same parent directory as its configuration:
+
+```
+~/.tool-agents/outlook-cli/
+├── .env                              ← config (existed since v3.0.1)
+├── config.json                       ← config (placeholder)
+├── session.json                      ← MOVED from ~/.outlook-cli/
+└── playwright-profile/                ← MOVED from ~/.outlook-cli/
+```
+
+Defaults for `sessionFilePath` and `profileDir` in `src/config/config.ts`
+were updated accordingly. `--session-file`, `--profile-dir`,
+`OUTLOOK_CLI_SESSION_FILE`, and `OUTLOOK_CLI_PROFILE_DIR` continue to
+work and are honored exactly as before.
+
+### Added — one-shot legacy auto-migration
+
+`src/cli.ts → migrateLegacyRuntimeData()` runs at startup (after
+`bootstrapToolConfigDir()`) and silently moves:
+
+- `~/.outlook-cli/session.json` → `~/.tool-agents/outlook-cli/session.json`
+- `~/.outlook-cli/playwright-profile/` → `~/.tool-agents/outlook-cli/playwright-profile/`
+
+Rules:
+- **Idempotent.** Only moves a path when the legacy path exists AND the
+  new path does NOT yet exist. Never overwrites.
+- **Skipped when overridden.** If `OUTLOOK_CLI_SESSION_FILE` or
+  `OUTLOOK_CLI_PROFILE_DIR` is set, the migration does nothing.
+- **Best-effort cleanup.** If the legacy `~/.outlook-cli/` directory
+  is empty after the moves (ignoring `.DS_Store`), it is removed.
+- **Silent.** Errors (cross-device renames, permission issues) are
+  swallowed; users can re-`login` or move files manually.
+
+### Migration impact
+
+- **Existing users with a logged-in session:** transparent. The next
+  invocation moves your `session.json` and Playwright profile into the
+  new location and you stay logged in.
+- **Users who hard-coded `~/.outlook-cli/session.json` in scripts:**
+  update the path, or set `OUTLOOK_CLI_SESSION_FILE=$HOME/.outlook-cli/session.json`
+  to opt out of the migration and keep the old location.
+- **Users with `--session-file` / `--profile-dir` overrides:** zero
+  impact; your override wins.
+
+---
+
+## [3.0.1] — 2026-04-30
+
+### Added — tool-conventions alignment
+
+- **Four-tier env-var resolution chain.** The CLI now loads
+  `~/.tool-agents/outlook-cli/.env` first, then `./.env`, both with
+  `override: false` so the shell env still wins. This brings the tool
+  in line with the project's tool-conventions §"four-tier resolution
+  chain" (shell env → user `.env` → local `.env` → CLI flag, lowest to
+  highest). Implemented in `src/cli.ts → bootstrapToolConfigDir()`.
+- **Auto-create `~/.tool-agents/outlook-cli/`** at startup with mode
+  `0700` (idempotent — tightens an existing wider mode). Same helper.
+- **Re-added `dotenv` runtime dependency** (`^17.0.0`) to support the
+  above. Both `dotenv.config()` calls pass `quiet: true` so the v17
+  startup banner does not pollute stdout.
+
+### Fixed — tool-conventions audit findings
+
+- **F-1 (critical):** regenerated `~/.tool-agents/outlook-cli/.env`.
+  Removed all stale `OUTLOOK_AGENT_*` and LLM-provider lines (dead
+  since v3.0.0). Now lists only the eight `OUTLOOK_CLI_*` keys the
+  CLI actually reads, all commented because all have safe defaults
+  or are optional overrides.
+- **F-4 (minor):** project `CLAUDE.md` Tools entry corrected from
+  "11 subcommands" to "12 subcommands" (the prose count was wrong;
+  the listed names already included `get-thread`).
+- **F-6 (minor):** `docs/tools/outlook-cli.md` subcommand list
+  renumbered from `1, 2, 3, 4, 4a, 5..11` to a clean sequential
+  `1..12`.
+
+---
+
+## [3.0.0] — 2026-04-30
+
+### Removed — BREAKING
+
+**The LangGraph ReAct agent has been removed in its entirety.** `outlook-cli`
+is now a pure CLI over the Outlook REST v2.0 API; the LLM-driven agent layer
+that shipped in v1.x–v2.x is gone.
+
+Specifically removed:
+
+- `outlook-cli agent` subcommand and all its flags
+  (`--interactive`, `--provider`, `--model`, `--system`, `--system-file`,
+  `--tools`, `--per-tool-budget`, `--allow-mutations`, `--env-file`,
+  `--agent-memory-file`, `--agent-model-file`, `--base-url`, `--config`,
+  `--verbose`).
+- All `OUTLOOK_AGENT_*` environment variables.
+- The interactive raw-mode TUI (token streaming, `/help`, `/memory`,
+  `/model`, `/copy`, `/new`, slash-command parser, memory + saved-model
+  persistence, model hot-swap).
+- LLM provider adapters (OpenAI, Anthropic, Gemini, Azure OpenAI,
+  Azure Anthropic, local-OpenAI, Azure DeepSeek).
+- The 11 LangGraph tool adapters (`auth-check-tool`, `list-mail-tool`, …,
+  `move-mail-tool`).
+- `~/.outlook-cli/agent-memory.json` and `~/.outlook-cli/agent-model.json`
+  files are no longer read or written (existing files on disk are
+  untouched — delete them yourself if you want).
+- Configuration tier for `memoryFile` and `modelFile` (the per-project
+  exception recorded for these in CLAUDE.md is also dropped).
+
+### Removed — dependencies
+
+- `@langchain/core`, `@langchain/openai`, `@langchain/anthropic`,
+  `@langchain/google-genai`, `@langchain/langgraph`
+- `langchain`
+- `dotenv` (was only used by the agent layer)
+- `zod` (was only used by the agent tool schemas)
+
+### Migration
+
+If you were using the agent, pin to `2.1.0` or fork it before upgrading.
+The CLI surface (`login`, `auth-check`, `list-mail`, `get-mail`,
+`get-thread`, `download-attachments`, `list-calendar`, `get-event`,
+`list-folders`, `find-folder`, `create-folder`, `move-mail`) is unchanged.
+
+---
+
 ## [2.1.0] — 2026-04-24
 
 ### Changed — BEHAVIORAL (config precedence reversed)

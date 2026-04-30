@@ -4,7 +4,12 @@
 // Commander bootstrap for the Outlook CLI.
 // See project-design.md §2.14 and refined-request-outlook-cli.md §5.
 
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
 import { Command, Option } from 'commander';
+import * as dotenv from 'dotenv';
 
 import {
   loadConfig,
@@ -58,7 +63,6 @@ import { LIST_FOLDERS_COLUMNS } from './commands/list-folders';
 import * as findFolder from './commands/find-folder';
 import * as createFolder from './commands/create-folder';
 import * as moveMail from './commands/move-mail';
-import * as agentCmd from './commands/agent';
 
 // ---------------------------------------------------------------------------
 // Package version (read lazily so --help doesn't need it)
@@ -554,7 +558,109 @@ function makeAction<O, Args extends unknown[]>(
   };
 }
 
+/**
+ * Tool-conventions §"four-tier env-var resolution chain":
+ *   shell env > ~/.tool-agents/<tool>/.env > local ./.env > CLI flags
+ * (tier 1 lowest, tier 4 highest). The CLI-flag tier is enforced by
+ * commander reading argv after env. This helper covers the two file
+ * tiers; the call to dotenv uses `override: false` so the shell env
+ * (already populated) always wins over both .env files.
+ *
+ * Also ensures `~/.tool-agents/outlook-cli/` exists at mode 0700.
+ */
+function bootstrapToolConfigDir(): void {
+  const dir = path.join(os.homedir(), '.tool-agents', 'outlook-cli');
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // mkdirSync's `mode` is honored only when the dir is freshly created.
+    // If it already existed with a wider mode, tighten it.
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // Non-fatal: if we cannot create or chmod the directory, the CLI can
+    // still run from shell env + CLI flags alone. Subsequent dotenv calls
+    // will silently no-op for a missing file.
+  }
+
+  const userEnv = path.join(dir, '.env');
+  if (fs.existsSync(userEnv)) {
+    dotenv.config({ path: userEnv, override: false, quiet: true });
+  }
+  // Local cwd/.env (last so it overrides the user-config .env, but still
+  // not the shell env because override:false on both calls).
+  dotenv.config({ override: false, quiet: true });
+}
+
+/**
+ * One-shot migration of legacy runtime data from the pre-3.1 location.
+ *
+ *   ~/.outlook-cli/session.json        →  ~/.tool-agents/outlook-cli/session.json
+ *   ~/.outlook-cli/playwright-profile/ →  ~/.tool-agents/outlook-cli/playwright-profile/
+ *
+ * Idempotent: only moves a path if (a) the legacy path exists and (b) the
+ * new path does NOT yet exist. Never overwrites. If the legacy directory
+ * ends up empty after both moves, removes it.
+ *
+ * Silent: failures are swallowed because the CLI can still operate on the
+ * new defaults — the migration is a best-effort convenience.
+ *
+ * Skipped entirely when the user has overridden either path via env vars
+ * or CLI flags (the override case implies the user is managing the
+ * location themselves).
+ */
+function migrateLegacyRuntimeData(): void {
+  // If the user has explicitly aimed either path elsewhere, do nothing.
+  if (
+    process.env.OUTLOOK_CLI_SESSION_FILE ||
+    process.env.OUTLOOK_CLI_PROFILE_DIR
+  ) {
+    return;
+  }
+
+  const legacyDir = path.join(os.homedir(), '.outlook-cli');
+  const newDir = path.join(os.homedir(), '.tool-agents', 'outlook-cli');
+
+  const moves: Array<{ legacy: string; next: string }> = [
+    {
+      legacy: path.join(legacyDir, 'session.json'),
+      next: path.join(newDir, 'session.json'),
+    },
+    {
+      legacy: path.join(legacyDir, 'playwright-profile'),
+      next: path.join(newDir, 'playwright-profile'),
+    },
+  ];
+
+  for (const { legacy, next } of moves) {
+    try {
+      if (fs.existsSync(legacy) && !fs.existsSync(next)) {
+        fs.renameSync(legacy, next);
+      }
+    } catch {
+      // Best-effort: ignore EXDEV (cross-device), EACCES, etc. The user
+      // can re-login or move manually.
+    }
+  }
+
+  // Best-effort cleanup: remove the legacy dir if it's now empty (and
+  // contains nothing other than a stray .DS_Store on macOS).
+  try {
+    if (fs.existsSync(legacyDir)) {
+      const remaining = fs
+        .readdirSync(legacyDir)
+        .filter((name) => name !== '.DS_Store');
+      if (remaining.length === 0) {
+        fs.rmSync(legacyDir, { recursive: true, force: true });
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
+  bootstrapToolConfigDir();
+  migrateLegacyRuntimeData();
+
   const program = new Command();
   program
     .name('outlook-cli')
@@ -944,119 +1050,6 @@ export async function main(argv: string[]): Promise<number> {
         if (result.failed.length > 0) {
           process.exitCode = 5;
         }
-      }),
-    );
-
-  // -------- agent [prompt] --------
-  program
-    .command('agent [prompt]')
-    .description(
-      'Run the LangGraph ReAct agent over your Outlook mailbox. Supply a prompt or pass --interactive for a REPL.',
-    )
-    .option(
-      '-i, --interactive',
-      'Start an interactive REPL (persists per-session history)',
-      false,
-    )
-    .option(
-      '-p, --provider <name>',
-      'LLM provider (openai, anthropic, gemini, azure-openai, azure-anthropic, local-openai, azure-deepseek). Falls back to OUTLOOK_AGENT_PROVIDER.',
-    )
-    .option(
-      '-m, --model <id>',
-      'Model id/deployment name. Falls back to OUTLOOK_AGENT_MODEL.',
-    )
-    .option('--max-steps <n>', 'Max ReAct iterations', (v: string) =>
-      Number.parseInt(v, 10),
-    )
-    .option('--temperature <t>', 'Sampling temperature', (v: string) =>
-      Number.parseFloat(v),
-    )
-    .option('--system <text>', 'Override the default system prompt')
-    .option('--system-file <path>', 'Read the system prompt from a file')
-    .option(
-      '--tools <csv>',
-      'Comma-separated allowlist of tool names; all tools by default',
-    )
-    .option(
-      '--per-tool-budget <bytes>',
-      'Byte budget for a single tool result',
-      (v: string) => Number.parseInt(v, 10),
-    )
-    .option(
-      '--allow-mutations',
-      'Expose mutation tools (create_folder, move_mail, download_attachments). OFF by default.',
-      false,
-    )
-    .option(
-      '--env-file <path>',
-      'Path to a .env file to load (overrides the default cwd/.env lookup). Process env always wins.',
-    )
-    .option(
-      '--agent-memory-file <path>',
-      'Path to the user-memory JSON file (default $HOME/.outlook-cli/agent-memory.json)',
-    )
-    .option(
-      '--agent-model-file <path>',
-      'Path to the saved-model JSON file (default $HOME/.outlook-cli/agent-model.json)',
-    )
-    .option(
-      '--base-url <url>',
-      'Override the LLM provider base URL (useful for local-openai / proxy endpoints)',
-    )
-    .option(
-      '--config <path>',
-      'Override ~/.tool-agents/outlook-cli/config.json path',
-    )
-    .option('--verbose', 'Emit per-step trace to stderr', false)
-    .action(
-      makeAction<
-        {
-          interactive?: boolean;
-          provider?: string;
-          model?: string;
-          maxSteps?: number;
-          temperature?: number;
-          system?: string;
-          systemFile?: string;
-          tools?: string;
-          perToolBudget?: number;
-          allowMutations?: boolean;
-          envFile?: string;
-          agentMemoryFile?: string;
-          agentModelFile?: string;
-          baseUrl?: string;
-          config?: string;
-          verbose?: boolean;
-        },
-        [string | undefined]
-      >(program, async (deps, g, cmdOpts, prompt) => {
-        const agentOpts: agentCmd.AgentOptions = {
-          interactive: cmdOpts.interactive ?? false,
-          provider: cmdOpts.provider,
-          model: cmdOpts.model,
-          maxSteps: cmdOpts.maxSteps,
-          temperature: cmdOpts.temperature,
-          systemPrompt: cmdOpts.system,
-          systemPromptFile: cmdOpts.systemFile,
-          tools: cmdOpts.tools,
-          perToolBudgetBytes: cmdOpts.perToolBudget,
-          allowMutations: cmdOpts.allowMutations ?? false,
-          envFile: cmdOpts.envFile,
-          agentMemoryFile: cmdOpts.agentMemoryFile,
-          agentModelFile: cmdOpts.agentModelFile,
-          baseUrl: cmdOpts.baseUrl,
-          configPath: cmdOpts.config,
-          verbose: cmdOpts.verbose ?? false,
-          logFile: g.logFile,
-          noAutoReauth: g.autoReauth === false,
-          quiet: g.quiet === true,
-        };
-        const result = await agentCmd.run(deps, prompt ?? null, agentOpts);
-        if (result) {
-          emitResult(result, resolveOutputMode(g));
-        }
-        // interactive returns void; its own REPL has already drained stdout.
       }),
     );
 

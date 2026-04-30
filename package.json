@@ -1,21 +1,49 @@
 {
-  "name": "outlook-tool",
-  "version": "2.1.0",
-  "description": "",
+  "name": "@biks2013/outlook-tool",
+  "version": "3.1.0",
+  "description": "CLI for Outlook web — authenticate via Playwright, manage inbox, calendar, folders, and attachments through the Outlook REST v2.0 API.",
   "main": "dist/cli.js",
   "bin": {
     "outlook-cli": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "postbuild": "chmod +x dist/cli.js",
     "cli": "ts-node src/cli.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build && npm test"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "outlook",
+    "microsoft",
+    "email",
+    "cli",
+    "playwright",
+    "calendar",
+    "automation"
+  ],
+  "author": "Giorgos Marinos",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BikS2013/outlook-tool.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BikS2013/outlook-tool/issues"
+  },
+  "homepage": "https://github.com/BikS2013/outlook-tool#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "commonjs",
   "devDependencies": {
     "@playwright/test": "^1.59.1",
@@ -26,14 +54,7 @@
     "vitest": "^4.1.4"
   },
   "dependencies": {
-    "@langchain/anthropic": "^1.3.0",
-    "@langchain/core": "^1.1.41",
-    "@langchain/google-genai": "^2.1.0",
-    "@langchain/langgraph": "^1.0.0",
-    "@langchain/openai": "^1.4.0",
     "commander": "^14.0.3",
-    "dotenv": "^17.0.0",
-    "langchain": "^1.3.0",
-    "zod": "^3.25.32"
+    "dotenv": "^17.0.0"
   }
 }

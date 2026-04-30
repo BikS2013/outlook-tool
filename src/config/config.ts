@@ -34,7 +34,7 @@ export interface CliConfig {
   chromeChannel: string;
 
   // Optional with explicit defaults allowed by spec §8
-  /** Path to the session file. Default: $HOME/.outlook-cli/session.json. */
+  /** Path to the session file. Default: $HOME/.tool-agents/outlook-cli/session.json. */
   sessionFilePath: string;
   /** Path to the Playwright persistent profile directory (mode 0700). */
   profileDir: string;
@@ -242,7 +242,7 @@ export function loadConfig(cliFlags: CliFlags): CliConfig {
     (process.env[ENV.SESSION_FILE] && process.env[ENV.SESSION_FILE] !== ''
       ? (process.env[ENV.SESSION_FILE] as string)
       : undefined) ??
-    path.join(home, '.outlook-cli', 'session.json');
+    path.join(home, '.tool-agents', 'outlook-cli', 'session.json');
 
   const profileDir =
     (typeof cliFlags.profileDir === 'string' && cliFlags.profileDir !== ''
@@ -251,7 +251,7 @@ export function loadConfig(cliFlags: CliFlags): CliConfig {
     (process.env[ENV.PROFILE_DIR] && process.env[ENV.PROFILE_DIR] !== ''
       ? (process.env[ENV.PROFILE_DIR] as string)
       : undefined) ??
-    path.join(home, '.outlook-cli', 'playwright-profile');
+    path.join(home, '.tool-agents', 'outlook-cli', 'playwright-profile');
 
   const tz =
     (typeof cliFlags.tz === 'string' && cliFlags.tz !== ''
