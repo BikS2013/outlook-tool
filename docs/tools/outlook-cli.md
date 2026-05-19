@@ -48,6 +48,23 @@
             without --overwrite)
           1 unexpected error
 
+        Output convention note:
+          Any command that returns a list of email messages should expose a
+          1-based, ascending reference number for each returned message. The
+          number must be stable for that specific output ordering, so a user can
+          refer back to "email 1", "email 2", etc. without copying long Outlook
+          message IDs. Table output should show it as a leading `#` column; JSON
+          output should include the same ordinal on each message object.
+
+        Email composition convention:
+          Whenever an agent creates a draft email or sends an email through this
+          tool, it must include the user's own authenticated mailbox address in
+          Cc. For the current mailbox this is `biks@nbg.gr`. Do not add a
+          duplicate Cc entry if that address is already present in To, Cc, or
+          Bcc. This convention applies to `create-draft`, any future send
+          command, and direct REST-backed draft/reply actions performed with the
+          tool's Outlook session.
+
         Subcommands:
 
         1. `login [--force]`

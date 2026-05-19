@@ -4,7 +4,44 @@
 
 <!-- Most critical / highest priority first. -->
 
-### 1. Global `~/.claude/CLAUDE.md` still references voided `memoryFile`/`modelFile` exception
+### 1. Email composition should automatically Cc the authenticated user
+
+**Status:** pending (2026-05-19, documented by user request).
+
+**Context:** `docs/tools/outlook-cli.md` and
+`docs/design/project-functions.MD` now record the convention that any draft or
+sent email created through the tool must include the user's own authenticated
+mailbox address in Cc. For the current mailbox this is `biks@nbg.gr`.
+
+**Action required:** implement the convention for `create-draft`, any future
+send command, and any direct REST-backed draft/reply action wrappers. The tool
+should avoid adding a duplicate if `biks@nbg.gr` is already present in To, Cc,
+or Bcc.
+
+**Effort:** small.
+
+---
+
+### 2. Email-list outputs need per-result reference numbering
+
+**Status:** pending (2026-05-19, documented by user request).
+
+**Context:** `docs/tools/outlook-cli.md` and
+`docs/design/project-functions.MD` now record the convention that every command
+returning a list of email messages should include a 1-based, ascending reference
+number. This improves follow-up references such as "open email 2" without
+requiring users to copy long Outlook message IDs.
+
+**Action required:** implement the convention for all email-list outputs,
+including at minimum `list-mail`, `get-mail` query mode, and `get-thread`.
+Table output should show a leading `#` column; JSON output should include the
+same ordinal on each message object.
+
+**Effort:** small.
+
+---
+
+### 3. Global `~/.claude/CLAUDE.md` still references voided `memoryFile`/`modelFile` exception
 
 **Status:** pending (2026-04-30, surfaced by the tool-conventions audit
 F-2).

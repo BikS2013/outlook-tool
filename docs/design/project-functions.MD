@@ -431,6 +431,25 @@ bounded at `5000` visited nodes. Off-host `nextLink` (any hostname other than
 The 401-retry-once envelope applies transparently per page. Source:
 outlook-v2-folder-pagination-filter §5 + §6.
 
+### FF-008 — Email-list reference numbering
+
+Any command that emits a list of email messages must include a 1-based,
+ascending reference number for each returned message. The ordinal is scoped to
+the emitted result and follows that result's ordering, so users can refer to
+"email 1", "email 2", etc. without copying long Outlook message IDs. Table
+output should render the ordinal as a leading `#` column; JSON output should
+include the same ordinal on each message object. Applies at minimum to
+`list-mail`, `get-mail` query mode, and `get-thread`.
+
+### FF-009 — Self-copy on email composition
+
+Whenever an agent creates a draft email or sends an email through this tool, the
+user's own authenticated mailbox address must be included in Cc. For the current
+mailbox this address is `biks@nbg.gr`. The address must not be duplicated if it
+is already present in To, Cc, or Bcc. This applies to `create-draft`, any future
+send command, and direct REST-backed draft/reply actions performed with the
+tool's Outlook session.
+
 ---
 
 ## Removed: Agent Subcommand (FR-AGT-1..13) and Agent Interactive TUI (F-TUI.1..7)
