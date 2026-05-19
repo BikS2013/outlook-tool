@@ -63,6 +63,14 @@ import { LIST_FOLDERS_COLUMNS } from './commands/list-folders';
 import * as findFolder from './commands/find-folder';
 import * as createFolder from './commands/create-folder';
 import * as moveMail from './commands/move-mail';
+import * as deleteMail from './commands/delete-mail';
+import * as createDraft from './commands/create-draft';
+import type {
+  DeleteEntry,
+  DeleteFailedEntry,
+  DeleteMailResult,
+} from './commands/delete-mail';
+import type { DraftSummary } from './commands/create-draft';
 
 // ---------------------------------------------------------------------------
 // Package version (read lazily so --help doesn't need it)
@@ -376,6 +384,70 @@ function toMoveMailRows(r: MoveMailResult): MoveMailRow[] {
     if (f.error?.message) parts.push(f.error.message);
     rows.push({
       sourceId: f.sourceId,
+      status: 'failed',
+      error: parts.join(' — '),
+    });
+  }
+  return rows;
+}
+
+interface DeleteMailRow {
+  id: string;
+  status: 'deleted' | 'failed';
+  error?: string;
+}
+
+const DELETE_MAIL_COLUMNS: ColumnSpec<DeleteMailRow>[] = [
+  {
+    header: 'Id',
+    extract: (r) => r.id ?? '',
+    // No maxWidth: message ids must stay intact.
+  },
+  {
+    header: 'Status',
+    extract: (r) => r.status ?? '',
+  },
+  {
+    header: 'Error',
+    extract: (r) => r.error ?? '',
+    maxWidth: 48,
+  },
+];
+
+const CREATE_DRAFT_COLUMNS: ColumnSpec<DraftSummary>[] = [
+  {
+    header: 'Subject',
+    extract: (r) => r.subject ?? '',
+    maxWidth: 48,
+  },
+  {
+    header: 'To',
+    extract: (r) => (Array.isArray(r.to) ? r.to.join(', ') : ''),
+    maxWidth: 40,
+  },
+  {
+    header: 'Draft',
+    extract: (r) => (r.isDraft === true ? 'yes' : r.isDraft === false ? 'no' : ''),
+  },
+  {
+    header: 'Id',
+    extract: (r) => r.id ?? '',
+  },
+];
+
+function toDeleteMailRows(r: DeleteMailResult): DeleteMailRow[] {
+  const rows: DeleteMailRow[] = [];
+  for (const d of r.deleted as DeleteEntry[]) {
+    rows.push({ id: d.id, status: 'deleted' });
+  }
+  for (const f of r.failed as DeleteFailedEntry[]) {
+    const parts: string[] = [];
+    if (f.error?.code) parts.push(f.error.code);
+    if (typeof f.error?.httpStatus === 'number')
+      parts.push(`HTTP ${f.error.httpStatus}`);
+    if (f.error?.message) parts.push(f.error.message);
+    rows.push({
+      id: f.id,
       status: 'failed',
       error: parts.join(' — '),
     });
@@ -751,9 +823,19 @@ export async function main(argv: string[]): Promise<number> {
         'or keyword: "now" / "now + Nd" / "now - Nd".',
     )
     .option(
+      '--from-address <email>',
+      'Only list messages whose sender email address equals this value ' +
+        '(case-insensitive)',
+    )
+    .option(
+      '--from-name <name>',
+      'Only list messages whose sender display name contains this value ' +
+        '(case-insensitive)',
+    )
+    .option(
       '--just-count',
       'Return only the count of matching messages (server-side via $count=true). ' +
-        'Ignores --top and --select. Works with every folder flag and --from/--to.',
+        'Ignores --top and --select. Works with every folder flag and filter.',
     )
     .action(
       makeAction<
@@ -765,6 +847,8 @@ export async function main(argv: string[]): Promise<number> {
           select?: string;
           from?: string;
           to?: string;
+          fromAddress?: string;
+          fromName?: string;
           justCount?: boolean;
         },
         []
@@ -784,20 +868,57 @@ export async function main(argv: string[]): Promise<number> {
       }),
     );
 
-  // -------- get-mail <id> --------
+  // -------- get-mail [id] --------
+  // Two lookup modes: by id (`get-mail <id>`) or by query
+  // (`get-mail --at <ts> [--subject ...] [--from-address ...]`).
+  // Lookup mode returns an array of full Message objects.
   program
     .command('get-mail')
-    .argument('<id>', 'Message id')
-    .description('Retrieve one message with optional body')
+    .argument('[id]', 'Message id (omit when using --at)')
+    .description(
+      'Retrieve one message by id, or every message at a given ' +
+        'ReceivedDateTime (optionally filtered by subject / sender)',
+    )
     .option('--body <mode>', 'Body inclusion: html|text|none')
+    .option(
+      '--at <timestamp>',
+      'Look up messages whose ReceivedDateTime exactly equals this ' +
+        'instant (ISO8601 or "now"/"now±Nd"). Returns an array.',
+    )
+    .option(
+      '--subject <text>',
+      'Narrow --at lookup: substring match on Subject (server-side, ' +
+        'case-sensitive).',
+    )
+    .option(
+      '--from-address <email>',
+      'Narrow --at lookup: exact match on the sender email address ' +
+        '(case-insensitive).',
+    )
     .action(
-      makeAction<{ body?: BodyMode }, [string]>(
-        program,
-        async (deps, g, cmdOpts, id) => {
-          const result = await getMail.run(deps, id, cmdOpts);
-          emitResult(result, resolveOutputMode(g));
+      makeAction<
+        {
+          body?: BodyMode;
+          at?: string;
+          subject?: string;
+          fromAddress?: string;
         },
-      ),
+        [string | undefined]
+      >(program, async (deps, g, cmdOpts, id) => {
+        const result = await getMail.run(deps, id, cmdOpts);
+        const mode = resolveOutputMode(g);
+        if (mode === 'table' && Array.isArray(result)) {
+          // Lookup mode: render the same column layout get-thread uses, since
+          // both surface a list of full Message objects.
+          emitResult(
+            result,
+            mode,
+            GET_THREAD_COLUMNS as unknown as ColumnSpec<unknown>[],
+          );
+        } else {
+          emitResult(result, mode);
+        }
+      }),
     );
 
   // -------- get-thread <id> --------
@@ -857,6 +978,44 @@ export async function main(argv: string[]): Promise<number> {
       }),
     );
 
+  // -------- create-draft --------
+  program
+    .command('create-draft')
+    .description('Create a saved email draft in Outlook without sending it')
+    .requiredOption(
+      '--to <emails>',
+      'Comma-separated To recipients. Also accepts "Name <email@example.com>".',
+    )
+    .option('--cc <emails>', 'Comma-separated Cc recipients')
+    .option('--bcc <emails>', 'Comma-separated Bcc recipients')
+    .requiredOption('--subject <text>', 'Draft subject')
+    .option('--body <text>', 'Draft body text')
+    .option('--body-file <path>', 'Read draft body from a UTF-8 text file')
+    .option('--body-type <text|html>', 'Draft body type (default text)')
+    .option('--importance <low|normal|high>', 'Draft importance')
+    .action(
+      makeAction<
+        {
+          to?: string;
+          cc?: string;
+          bcc?: string;
+          subject?: string;
+          body?: string;
+          bodyFile?: string;
+          bodyType?: string;
+          importance?: string;
+        },
+        []
+      >(program, async (deps, g, cmdOpts) => {
+        const result = await createDraft.run(deps, cmdOpts);
+        emitResult(
+          result,
+          resolveOutputMode(g),
+          CREATE_DRAFT_COLUMNS as unknown as ColumnSpec<unknown>[],
+        );
+      }),
+    );
+
   // -------- list-calendar --------
   program
     .command('list-calendar')
@@ -906,6 +1065,10 @@ export async function main(argv: string[]): Promise<number> {
     .option('--recursive', 'Walk the full sub-tree (bounded)', false)
     .option('--include-hidden', 'Include folders whose IsHidden === true', false)
     .option(
+      '--contains <substring>',
+      'Only emit folders whose materialized path contains this substring',
+    )
+    .option(
       '--first-match',
       'On ambiguity, pick the oldest candidate (CreatedDateTime asc, Id asc)',
       false,
@@ -917,6 +1080,7 @@ export async function main(argv: string[]): Promise<number> {
           top?: number;
           recursive?: boolean;
           includeHidden?: boolean;
+          contains?: string;
           firstMatch?: boolean;
         },
         []
@@ -1047,6 +1211,48 @@ export async function main(argv: string[]): Promise<number> {
         // Partial-failure rule (§10.7 / plan-002 §P5d): any entry in
         // `failed[]` must surface as exit 5 even though `run()` returned
         // normally. The payload is already emitted above.
+        if (result.failed.length > 0) {
+          process.exitCode = 5;
+        }
+      }),
+    );
+
+  // -------- delete-mail <messageIds...> --------
+  program
+    .command('delete-mail')
+    .argument(
+      '<messageIds...>',
+      'One or more message ids to delete',
+    )
+    .description('Delete one or more messages by id (requires --yes)')
+    .requiredOption(
+      '--yes',
+      'Confirm deletion. Required so accidental invocations do not delete mail.',
+    )
+    .option(
+      '--continue-on-error',
+      'Collect per-message failures into failed[] instead of aborting',
+      false,
+    )
+    .action(
+      makeAction<
+        {
+          yes?: boolean;
+          continueOnError?: boolean;
+        },
+        [string[]]
+      >(program, async (deps, g, cmdOpts, messageIds) => {
+        const result = await deleteMail.run(deps, messageIds, cmdOpts);
+        const mode = resolveOutputMode(g);
+        if (mode === 'table') {
+          emitResult(
+            toDeleteMailRows(result),
+            mode,
+            DELETE_MAIL_COLUMNS as unknown as ColumnSpec<unknown>[],
+          );
+        } else {
+          emitResult(result, mode);
+        }
         if (result.failed.length > 0) {
           process.exitCode = 5;
         }

@@ -34,8 +34,10 @@ That is what this tool does.
   (mode `0600`, parent dir `0700`).
 - `auth-check` — non-interactive verification that the cached session is still
   accepted.
-- `list-mail`, `get-mail`, `download-attachments` — inbox + message access,
-  including saving attachments to a directory.
+- `list-mail`, `get-mail`, `download-attachments`, `delete-mail`, `create-draft`
+  — inbox + message access, including saving attachments to a directory,
+  explicitly confirmed deletion by message id, and preparing saved drafts for
+  manual sending in Outlook.
 - `list-calendar`, `get-event` — calendar window listing and single-event retrieval.
 - `list-folders`, `find-folder`, `create-folder`, `move-mail` — full folder
   management: list, resolve by name/path/id, create (idempotently), and move
@@ -46,9 +48,11 @@ That is what this tool does.
 
 ### What it deliberately does **not** do
 
-- It does not send mail, delete messages, or modify calendar events. It is a
-  **read + organize** surface, not a full client.
-- It does not persist anything upstream. The session file is local-only.
+- It does not send mail, permanently purge mailbox items, or modify calendar
+  events. Draft creation stops at a saved Drafts-folder message that the user
+  sends manually through Outlook.
+- It does not persist anything locally beyond the session file and files the
+  user explicitly asks it to write.
 - It does not bypass conditional access, MFA, or any tenant policy — you log in
   exactly the way the browser would.
 
@@ -132,7 +136,7 @@ built-in `node:*` modules.
 | [`@types/node`](https://www.npmjs.com/package/@types/node) | `^25.6.0` | Type definitions for Node core APIs. |
 | [`playwright`](https://playwright.dev/) | `^1.59.1` | Drives the headed Chrome window during `login` and captures the outbound Bearer token + cookies. |
 | [`@playwright/test`](https://playwright.dev/docs/intro) | `^1.59.1` | Test-runner companion (present as a dev-dep; no live browser tests run in CI). |
-| [`vitest`](https://vitest.dev/) | `^4.1.4` | Test framework for the 208 unit + integration tests in `test_scripts/`. |
+| [`vitest`](https://vitest.dev/) | `^4.1.4` | Test framework for the 282 unit + integration tests in `test_scripts/`. |
 
 ### External binaries you provide
 
@@ -176,7 +180,7 @@ npm run cli -- <subcommand> [options]
 ## Run the tests
 
 ```bash
-npm test               # vitest run — 208 tests across 17 files
+npm test               # vitest run — 282 tests across 27 files
 npm run test:watch     # incremental
 ```
 
@@ -256,6 +260,13 @@ outlook-cli get-mail AAMkAGI... --body text > message.json
 
 # Save all non-inline attachments to ./att
 outlook-cli download-attachments AAMkAGI... --out ./att
+
+# Create a saved draft for review and manual sending in Outlook
+outlook-cli create-draft \
+  --to "Bob <bob@example.com>,carol@example.com" \
+  --subject "Planning notes" \
+  --body-file ./draft-body.html \
+  --body-type html
 ```
 
 ### Mail received between two timestamps
@@ -272,13 +283,18 @@ outlook-cli list-mail --from "now - 7d" --table
 # Absolute window (one calendar month)
 outlook-cli list-mail --from 2026-04-01T00:00:00Z --to 2026-05-01T00:00:00Z --top 100
 
+# From a sender email address or display name
+outlook-cli list-mail --from-address alice@example.com --table
+outlook-cli list-mail --from-name "Alice Example" --table
+
 # Combine with folder selection
 outlook-cli list-mail --folder "Inbox/Projects/Alpha" \
+                      --from-address alice@example.com \
                       --from "now - 30d" --top 50
 
 # Just the count of matching messages (no payload, server-side $count)
 outlook-cli list-mail --just-count
-outlook-cli list-mail --folder Archive --from "now - 365d" --just-count
+outlook-cli list-mail --folder Archive --from-address alice@example.com --just-count
 # → { "count": 4273, "exact": true }
 ```
 
@@ -301,6 +317,19 @@ outlook-cli get-thread AAMkAGI... --order desc --body none > thread.json
 outlook-cli get-thread "conv:AAQkAGI..."
 ```
 
+### Delete mail by id
+
+```bash
+# Delete one message. --yes is required.
+outlook-cli delete-mail AAMkAGI... --yes
+
+# Delete several messages sequentially
+outlook-cli delete-mail AAMk1... AAMk2... AAMk3... --yes
+
+# Keep going after per-message failures and report failed[]
+outlook-cli delete-mail AAMk1... AAMk2... --yes --continue-on-error
+```
+
 ### Calendar
 
 ```bash
@@ -319,6 +348,9 @@ outlook-cli list-folders --table
 
 # Walk the whole tree (bounded)
 outlook-cli list-folders --recursive --table
+
+# Find folders whose materialized path contains a substring
+outlook-cli list-folders --recursive --contains project --table
 
 # Resolve a folder by display-name path
 outlook-cli find-folder "Inbox/Projects/Alpha"
@@ -375,7 +407,7 @@ src/
   output/                # JSON / table formatter
   config/                # loadConfig, env + flag precedence, defaults
   util/                  # redaction, filename safety, misc helpers
-test_scripts/            # vitest suites (208 tests)
+test_scripts/            # vitest suites (282 tests)
 docs/
   design/                # refined specs, plans, project-design, config guide
   reference/             # codebase scans

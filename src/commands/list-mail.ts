@@ -40,6 +40,10 @@ export interface ListMailOptions {
   from?: string;
   /** Upper bound (exclusive) on ReceivedDateTime. ISO8601 or "now"/"now±Nd". */
   to?: string;
+  /** Exact equality on From/EmailAddress/Address (case-insensitive). */
+  fromAddress?: string;
+  /** Substring match on From/EmailAddress/Name (case-insensitive). */
+  fromName?: string;
   /**
    * When true, return just the count of matching messages (server-side via
    * `$count=true`) instead of the messages themselves. Ignores `--top`
@@ -127,10 +131,10 @@ export async function run(
       ? opts.select
       : DEFAULT_SELECT;
 
-  // Optional date window (--from / --to). Each bound independently resolves
-  // to an ISO8601 UTC timestamp; the server is queried with `ge` / `lt` for
-  // an inclusive-lower, exclusive-upper window. Either bound may be omitted.
-  const filter = buildReceivedDateFilter(opts.from, opts.to);
+  // Optional server-side filter. Date bounds resolve to an inclusive-lower,
+  // exclusive-upper ReceivedDateTime window. Sender filters narrow by exact
+  // email address or substring display-name match.
+  const filter = buildListMailFilter(opts);
 
   // Session load. If missing/expired and auto-reauth is allowed, capture a
   // fresh session before we build the client.
@@ -234,16 +238,13 @@ export async function run(
  * (`lt`), matching the calendar-view convention and allowing day-aligned
  * windows to be specified without overlap.
  */
-function buildReceivedDateFilter(
-  from: string | undefined,
-  to: string | undefined,
+function buildListMailFilter(
+  opts: Pick<ListMailOptions, 'from' | 'to' | 'fromAddress' | 'fromName'>,
 ): string | undefined {
+  const parts: string[] = [];
+  const { from, to } = opts;
   const hasFrom = typeof from === 'string' && from.length > 0;
   const hasTo = typeof to === 'string' && to.length > 0;
-  if (!hasFrom && !hasTo) {
-    return undefined;
-  }
-  const parts: string[] = [];
   if (hasFrom) {
     const r = parseTimestamp(from);
     if (!r.ok) {
@@ -258,7 +259,46 @@ function buildReceivedDateFilter(
     }
     parts.push(`ReceivedDateTime lt ${r.iso}`);
   }
-  return parts.join(' and ');
+
+  const fromAddress = normalizeRequiredFilterValue(
+    opts.fromAddress,
+    '--from-address',
+  );
+  if (fromAddress !== undefined) {
+    parts.push(
+      `tolower(From/EmailAddress/Address) eq '${escapeODataString(
+        fromAddress.toLocaleLowerCase('en-US'),
+      )}'`,
+    );
+  }
+
+  const fromName = normalizeRequiredFilterValue(opts.fromName, '--from-name');
+  if (fromName !== undefined) {
+    parts.push(
+      `contains(tolower(From/EmailAddress/Name),'${escapeODataString(
+        fromName.toLocaleLowerCase('en-US'),
+      )}')`,
+    );
+  }
+
+  return parts.length > 0 ? parts.join(' and ') : undefined;
+}
+
+function normalizeRequiredFilterValue(
+  raw: string | undefined,
+  flag: string,
+): string | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    throw new UsageError(`list-mail: ${flag} must not be empty`);
+  }
+  return trimmed.normalize('NFC');
+}
+
+/** OData string-literal escape: only the single quote needs doubling. */
+function escapeODataString(s: string): string {
+  return s.replace(/'/g, "''");
 }
 
 // ---------------------------------------------------------------------------

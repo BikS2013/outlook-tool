@@ -28,6 +28,19 @@ code change.
 
 <!-- Completed items moved here. -->
 
+### 2026-05-19 — outlook-cli capability docs synced for folder substring search and delete-mail
+
+- **[done] `docs/tools/outlook-cli.md` now advertises `list-folders --contains`.**
+  The implementation and README already supported path-substring folder search,
+  but the dedicated tool capability document omitted the flag. Added the option
+  semantics and a `--recursive --contains hirings --table` example so agents can
+  answer requests like "list the hirings folders" through the standard CLI.
+
+- **[done] Tool capability docs now include `delete-mail`.** The command existed
+  in source and README, but `docs/tools/outlook-cli.md` and the concise
+  `CLAUDE.md` Tools entry were stale. Added the `delete-mail` command contract
+  and updated the subcommand count from 12 to 13.
+
 ### 2026-04-30 — runtime data consolidated under `~/.tool-agents/outlook-cli/` (v3.1.0)
 
 - **[done] `sessionFilePath` and `profileDir` defaults moved.** From

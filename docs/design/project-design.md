@@ -27,6 +27,29 @@ Folder-management extension (§10, ADR-13..ADR-16) additionally consumes:
 13. `docs/research/outlook-v2-folder-duplicate-error.md`
 14. `docs/reference/codebase-scan-folders.md`
 
+List-folder substring filtering (§12) additionally consumes:
+
+15. `docs/reference/refined-request-list-folders-substring.md`
+16. `docs/design/plan-003-list-folders-substring.md`
+
+List-mail sender filtering (§13) additionally consumes:
+
+17. `docs/reference/refined-request-list-mail-sender-filter.md`
+18. `docs/design/plan-004-list-mail-sender-filter.md`
+
+Delete-mail by id (§14) additionally consumes:
+
+19. `docs/reference/refined-request-delete-mail-by-id.md`
+20. `docs/design/plan-005-delete-mail.md`
+21. `docs/research/outlook-v2-delete-message.md`
+
+Create-draft email (§15) additionally consumes:
+
+22. `docs/reference/refined-request-create-draft-email.md`
+23. `docs/design/plan-006-create-draft-email.md`
+24. `docs/research/outlook-v2-create-draft-message.md`
+25. `docs/reference/codebase-scan-create-draft-email.md`
+
 ---
 
 ## 1. System Overview
@@ -1072,31 +1095,74 @@ program
 
 #### 2.13.4 `src/commands/get-mail.ts`
 
+**Two lookup modes — exactly one applies per invocation:**
+- **Id mode** — positional `<id>` provided. One full `Message` is returned.
+- **Query mode** — `<id>` omitted, `--at <ts>` provided. Optional
+  `--subject <text>` / `--from-address <email>` narrow the match. Returns
+  an array of full `Message` objects (every match, server-side capped at 50,
+  ordered `ReceivedDateTime desc`).
+
 **commander registration:**
 
 ```typescript
 program
-  .command('get-mail <id>')
-  .description('Retrieve one message with optional body')
+  .command('get-mail [id]')
+  .description(
+    'Retrieve one message by id, or every message at a given ' +
+      'ReceivedDateTime (optionally filtered by subject / sender)',
+  )
   .option('--body <mode>', 'Body inclusion: html|text|none', 'text')
-  .action(async (id: string, opts: { body: BodyMode }) => { /* ... */ });
+  .option('--at <timestamp>', 'Lookup mode: ReceivedDateTime exact equality')
+  .option('--subject <text>',
+          'Narrow --at lookup with contains(Subject,...)')
+  .option('--from-address <email>',
+          'Narrow --at lookup with exact equality (case-insensitive)')
+  .action(async (id, opts) => { /* ... */ });
 ```
 
-**Algorithm (5 steps):**
+**Algorithm:**
 
+0. **Mode validation** (raises `UsageError` exit 2):
+   - Neither `<id>` nor `--at` → fail.
+   - Both `<id>` and `--at` → fail.
+   - `--subject` or `--from-address` set but `--at` unset → fail.
 1. Validate `body` ∈ `{'html','text','none'}`.
-2. Build client.
-3. `message = await client.get<Message>('/api/v2.0/me/messages/${id}')`.
-4. `attachments = await client.get<{ value: AttachmentSummary[] }>('/api/v2.0/me/messages/${id}/attachments', { $select: 'Id,Name,ContentType,Size,IsInline' })`.
-5. Shape output: `{ ...message, Attachments: attachments.value }`. If `body === 'none'` strip `Body`; if `body === 'text'` and `Body.ContentType === 'HTML'` pass through as-is (client does not convert — refined spec defers HTML→text conversion).
+2. Ensure session, build client.
+3. **Id mode** — execute steps 4-6 once for the supplied id.
+   **Query mode** — parse `--at` via the shared `parseTimestamp` helper
+   (UsageError on malformed input), build the OData `$filter`:
+   `ReceivedDateTime eq <iso>` AND, if present,
+   `contains(Subject,'<escaped>')` AND
+   `tolower(From/EmailAddress/Address) eq '<lc-escaped>'`.
+   Then `GET /api/v2.0/me/messages?$filter=…&$select=Id,Subject,From,
+   ReceivedDateTime&$orderby=ReceivedDateTime desc&$top=50`. For every
+   returned id, execute steps 4-6.
+4. `message = await client.get<Message>('/api/v2.0/me/messages/${id}')`.
+5. `attachments = await client.get<{ value: AttachmentSummary[] }>(
+   '/api/v2.0/me/messages/${id}/attachments',
+   { $select: 'Id,Name,ContentType,Size,IsInline' })`.
+6. Shape per-message output: `{ ...message, Attachments: attachments.value }`.
+   If `body === 'none'` strip `Body`; otherwise pass `Body` through
+   unchanged (HTML→text conversion is deferred per refined spec).
+
+**OData escaping.** Single quotes inside `--subject` / `--from-address`
+literals are doubled (`'` → `''`) per OData v4 string-literal grammar.
+Email addresses are lower-cased before escaping so the `tolower(...)`
+comparison is symmetric.
 
 **REST endpoints:**
-- `GET /api/v2.0/me/messages/{id}`
-- `GET /api/v2.0/me/messages/{id}/attachments?$select=Id,Name,ContentType,Size,IsInline`
+- Query mode discovery: `GET /api/v2.0/me/messages?$filter=...&$top=50`
+- Per-match (id or query mode):
+  - `GET /api/v2.0/me/messages/{id}`
+  - `GET /api/v2.0/me/messages/{id}/attachments?$select=Id,Name,ContentType,Size,IsInline`
 
-**Output:** `Message` (§3.2) with added `Attachments: AttachmentSummary[]` field.
+**Output:**
+- Id mode: a single `Message` (§3.2) with added `Attachments: AttachmentSummary[]`.
+- Query mode: `Message[]` with the same per-element shape; empty array on no match.
 
-**Exit codes:** 0; 2 (missing id); 3; 4; 5 (invalid id → 404 → exit 5); 6.
+**Exit codes:** 0; 2 (missing both id and `--at`; both supplied; subject /
+from-address without `--at`; malformed `--at` timestamp); 3; 4; 5 (invalid
+id → 404 → exit 5); 6.
 
 ---
 
@@ -1840,10 +1906,17 @@ entry, followed by one child entry per subcommand. Template:
           Inbox, SentItems, Drafts, DeletedItems, Archive.</info>
   </list-mail>
   <get-mail>
-    <objective>Retrieve one message with body and attachment metadata.</objective>
-    <command>outlook-cli get-mail &lt;id&gt; [--body html|text|none]</command>
-    <info>Fetches GET /me/messages/{id} and attachments metadata.
-          Body default: text.</info>
+    <objective>Retrieve one message by id, OR every message at a given
+               ReceivedDateTime (optionally narrowed by subject / sender).
+               Body and attachment metadata included in both modes.</objective>
+    <command>outlook-cli get-mail [&lt;id&gt;] [--body html|text|none]
+                                  [--at &lt;ts&gt; [--subject &lt;text&gt;] [--from-address &lt;email&gt;]]</command>
+    <info>Two lookup modes — exactly one must be used. Id mode returns one
+          Message. Query mode (--at) returns Message[] (all matches, capped
+          50, ordered ReceivedDateTime desc). --subject runs server-side
+          contains(); --from-address is exact, case-insensitive. --at accepts
+          ISO8601 or "now"/"now±Nd" and matches via exact equality. Body
+          default: text.</info>
   </get-mail>
   <download-attachments>
     <objective>Save all non-inline attachments of a message to disk.</objective>
@@ -2620,11 +2693,11 @@ in §2.13; this table documents only the new and changed surface.
 
 | Subcommand         | Positional     | Flags                                                                                                                                                                                                                                                                           | Exit codes | JSON shape                                                          | Table columns                                |
 |--------------------|----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|---------------------------------------------------------------------|----------------------------------------------|
-| `list-folders`     | —              | `--parent <name-or-path-or-id>` (default `MsgFolderRoot`, ADR-15); `--recursive`; `--include-hidden`; `--top <N>` (1..250, default 100)                                                                                                                                          | 0/2/3/4/5  | `FolderSummary[]` (with `Path` when `--recursive`)                  | `Path \| Unread \| Total \| Children \| Id`  |
+| `list-folders`     | —              | `--parent <name-or-path-or-id>` (default `MsgFolderRoot`, ADR-15); `--recursive`; `--include-hidden`; `--contains <substring>`; `--top <N>` (1..250, default 100)                                                                                                                 | 0/2/3/4/5  | `FolderSummary[]` (with `Path`; optionally filtered by `--contains`) | `Path \| Unread \| Total \| Children \| Id`  |
 | `find-folder`      | `<query>`      | `--parent <anchor>` (default `MsgFolderRoot`); `--case-sensitive`; `--include-hidden`; `--first-match`                                                                                                                                                                           | 0/2/3/4/5  | single `ResolvedFolder`                                             | JSON fallback (no ColumnSpec; `find-folder` is a single-object payload — see §2.13.7 pattern) |
 | `create-folder`    | `<path>`       | `--parent <anchor>` (default `MsgFolderRoot`); `--create-parents`; `--idempotent`; `--display-name <name>` (override last segment's DisplayName)                                                                                                                                  | 0/2/3/4/5/6 | `CreateFolderResult`                                                | `Path \| Id \| PreExisting` (applied to `result.created`)  |
 | `move-mail`        | `[id]`         | `--to <name-or-path>` XOR `--to-id <folderId>`; `--to-parent <anchor>` (default `MsgFolderRoot`); `--ids-from <path-or-dash>` (XOR with `<id>`); `--continue-on-error`; `--stop-at <N>` (default 1000, range 1..10000); `--first-match`                                              | 0/2/3/4/5  | `MoveMailResult`                                                    | `Source Id \| New Id \| Status \| Error`     |
-| `list-mail` (ext.) | —              | **Additive to §2.13.3**: `--folder-id <id>` (XOR with `--folder`); `--folder-parent <anchor>` (default `MsgFolderRoot`). `--folder` widened to accept paths and all other well-known aliases (`JunkEmail`, `Outbox`, `MsgFolderRoot`, `RecoverableItemsDeletions`).            | 0/2/3/4/5/6 | `MessageSummary[]` (unchanged)                                      | `Received \| From \| Subject \| Att \| Id` (unchanged) |
+| `list-mail` (ext.) | —              | **Additive to §2.13.3**: `--folder-id <id>` (XOR with `--folder`); `--folder-parent <anchor>` (default `MsgFolderRoot`). `--folder` widened to accept paths and all other well-known aliases (`JunkEmail`, `Outbox`, `MsgFolderRoot`, `RecoverableItemsDeletions`). Sender filters `--from-address <email>` and `--from-name <name>` are additive to the existing date filter. | 0/2/3/4/5/6 | `MessageSummary[]` (unchanged)                                      | `Received \| From \| Subject \| Att \| Id` (unchanged) |
 
 **Validation (normative, enforced in command `run()` before REST):**
 
@@ -2958,13 +3031,261 @@ The existing folder-flag exclusivity rules (§10.7) remain unchanged.
   mode, `conv:` mode, body / order options, empty-input guards, and the
   no-ConversationId edge case.
 
-Total suite at [1.3.0]: **240 tests** across 21 files.
+Total suite after Plan 006 create-draft email: **282 tests** across 27 files.
+
+---
+
+## 12. List-Folders Substring Filter Extension
+
+Source:
+
+1. `docs/reference/refined-request-list-folders-substring.md`
+2. `docs/design/plan-003-list-folders-substring.md`
+3. `docs/reference/codebase-scan-folders.md`
+
+### 12.1 Scope
+
+`list-folders` gains an additive `--contains <substring>` option. This does
+not introduce a new Outlook REST call or a new command module; it reuses the
+existing `list-folders` materialization path.
+
+### 12.2 Behavior
+
+The command first performs the same parent resolution, hidden-folder filtering,
+recursive traversal, and `Path` materialization that it already performed. It
+then filters the resulting `ListFoldersRow[]` locally:
+
+```text
+row matches when normalize(row.Path).includes(normalize(substring))
+```
+
+Normalization is Unicode NFC plus `toLocaleLowerCase('en-US')`. Empty or
+whitespace-only substrings are rejected as `UsageError` before any session or
+REST work starts.
+
+### 12.3 Integration
+
+Files changed:
+
+- `src/commands/list-folders.ts` — `ListFoldersOptions.contains`, validation,
+  and local row filtering.
+- `src/cli.ts` — `list-folders --contains <substring>` commander option.
+- `test_scripts/commands-list-folders.spec.ts` — command-level tests for direct
+  matching, recursive path matching, and empty-input validation.
+
+The extension preserves the existing JSON/table output shapes and composes with
+`--parent`, `--recursive`, `--include-hidden`, `--top`, and `--first-match`.
+
+---
+
+## 13. List-Mail Sender Filter Extension
+
+Source:
+
+1. `docs/reference/refined-request-list-mail-sender-filter.md`
+2. `docs/design/plan-004-list-mail-sender-filter.md`
+3. `docs/reference/codebase-scan-folders.md`
+
+### 13.1 Scope
+
+`list-mail` gains two additive sender filters:
+
+- `--from-address <email>` for exact case-insensitive sender address matching.
+- `--from-name <name>` for case-insensitive substring matching on sender
+  display name.
+
+No new command module, runtime dependency, or output shape is introduced.
+
+### 13.2 Filter Construction
+
+`src/commands/list-mail.ts` builds one server-side `$filter` expression from
+date and sender inputs:
+
+```text
+ReceivedDateTime ge <from>
+ReceivedDateTime lt <to>
+tolower(From/EmailAddress/Address) eq '<lowercase-address>'
+contains(tolower(From/EmailAddress/Name),'<lowercase-name>')
+```
+
+Only supplied filters are included, joined with `and`. OData string literals
+escape single quotes by doubling them. Empty or whitespace-only sender values
+raise `UsageError` before any REST call.
+
+### 13.3 Integration
+
+The composed filter is threaded through every existing list-mail path:
+
+- Fast-path folder aliases use `client.get(..., { $filter })`.
+- `--folder-id` uses `client.listMessagesInFolder(id, { filter })`.
+- Resolved folder paths use `client.listMessagesInFolder(resolvedId, { filter })`.
+- `--just-count` uses `client.countMessagesInFolder(folderId, { filter })`.
+
+The existing `--top` bound still limits returned summaries in list mode.
+`--just-count` remains the constant-payload way to count all matching messages
+in a folder.
+
+---
+
+## 14. Delete-Mail by ID
+
+Source:
+
+1. `docs/reference/refined-request-delete-mail-by-id.md`
+2. `docs/design/plan-005-delete-mail.md`
+3. `docs/research/outlook-v2-delete-message.md`
+
+### 14.1 Scope
+
+`delete-mail` deletes one or more messages by Outlook message id:
+
+```text
+outlook-cli delete-mail <messageIds...> --yes [--continue-on-error]
+```
+
+The operation is a normal Outlook message delete, not a permanent purge. It
+does not search for messages; callers compose it with `list-mail`, `get-thread`,
+or shell tooling to collect ids first.
+
+### 14.2 HTTP Client
+
+`src/http/outlook-client.ts` adds `deleteMessage(messageId): Promise<void>`.
+The method calls:
+
+```text
+DELETE /api/v2.0/me/messages/{messageId}
+```
+
+It reuses the existing request envelope, so Authorization, cookies,
+`X-AnchorMailbox`, per-request timeout, and 401 retry-once behavior are
+identical to existing GET/POST methods. The expected success response is
+`204 No Content`; empty bodies are treated as success.
+
+### 14.3 Command Behavior
+
+`src/commands/delete-mail.ts` validates ids and requires `--yes` before session
+loading or REST calls. It deletes ids sequentially:
+
+- Success appends `{ id }` to `deleted[]`.
+- Failure without `--continue-on-error` aborts immediately.
+- Failure with `--continue-on-error` appends `{ id, error }` to `failed[]` and
+  continues.
+
+JSON output:
+
+```json
+{
+  "deleted": [{ "id": "AAMk..." }],
+  "failed": [],
+  "summary": { "requested": 1, "deleted": 1, "failed": 0 }
+}
+```
+
+Table output uses `Id | Status | Error`. Partial failure emits the payload and
+sets exit code `5`.
+
+---
+
+## 15. Create Draft Email
+
+Source:
+
+1. `docs/reference/refined-request-create-draft-email.md`
+2. `docs/design/plan-006-create-draft-email.md`
+3. `docs/research/outlook-v2-create-draft-message.md`
+4. `docs/reference/codebase-scan-create-draft-email.md`
+
+### 15.1 Scope
+
+`create-draft` creates a saved draft email in Outlook:
+
+```text
+outlook-cli create-draft --to <emails> --subject <text> (--body <text> | --body-file <path>)
+```
+
+The command is explicitly draft-only. It calls the documented Drafts shortcut
+`POST /api/v2.0/me/messages` and never calls the separate send action
+`POST /api/v2.0/me/messages/{message_id}/send`.
+
+Initial scope supports:
+
+- required `--to`, `--subject`, and one body source;
+- optional `--cc`, `--bcc`, `--body-type <text|html>`, and
+  `--importance <low|normal|high>`;
+- comma-separated recipient lists, with optional `Name <email@example.com>`
+  tokens;
+- body text read directly from the CLI or from a UTF-8 file.
+
+Attachments, reply drafts, forward drafts, delegated send-as behavior, and
+direct sending remain out of scope.
+
+### 15.2 HTTP Client
+
+`src/http/outlook-client.ts` exposes:
+
+```typescript
+createDraftMessage(request: CreateDraftMessageRequest): Promise<DraftMessage>
+```
+
+The method validates the minimum request shape and posts the writable message
+payload to:
+
+```text
+POST /api/v2.0/me/messages
+```
+
+It reuses the same authorization headers, cookie header, `X-AnchorMailbox`,
+timeout, JSON serialization, and 401 retry-once behavior as the existing GET
+and POST semantic methods. Non-2xx responses are mapped through the existing
+HTTP-to-CLI error taxonomy.
+
+### 15.3 Command Behavior
+
+`src/commands/create-draft.ts` validates user input before session loading or
+REST calls:
+
+- `--to` must contain at least one email-like address.
+- `--subject` must be non-empty.
+- exactly one of `--body` and `--body-file` must be supplied.
+- `--body-type` must be `text` or `html`.
+- `--importance` must be `low`, `normal`, or `high`.
+
+It builds a v2.0 message payload with PascalCase wire fields:
+
+```json
+{
+  "Subject": "Planning",
+  "Body": { "ContentType": "HTML", "Content": "<p>Hello</p>" },
+  "ToRecipients": [{ "EmailAddress": { "Address": "bob@example.com" } }],
+  "Importance": "High"
+}
+```
+
+JSON output is a stable summary:
+
+```json
+{
+  "id": "AAMk...",
+  "subject": "Planning",
+  "isDraft": true,
+  "importance": "High",
+  "to": ["bob@example.com"],
+  "cc": [],
+  "bcc": [],
+  "webLink": "https://outlook.office.com/owa/?ItemID=...",
+  "createdDateTime": "2026-05-19T10:00:00Z",
+  "lastModifiedDateTime": "2026-05-19T10:00:01Z",
+  "sentDateTime": null
+}
+```
+
+Table output uses `Subject | To | Draft | Id`.
 
 ---
 
 ## Summary
 
-- Full, contract-grade TypeScript design spanning 14 base modules + 6 folder-feature
+- Full, contract-grade TypeScript design spanning 15 base modules + 6 folder-feature
   modules across 7 layers (config, session, auth, http, folders, commands, output/util).
 - Mandatory vs. optional configuration enforced per refined spec §8; `ConfigurationError`
   is the only path for missing mandatory settings.
@@ -2999,4 +3320,3 @@ and the rationale.
 If you are reading this design doc to recover the agent surface,
 check out tag `v2.1.0` of this repository — the source, tests, and
 in-line design sections are preserved there.
-

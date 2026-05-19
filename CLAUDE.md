@@ -52,6 +52,9 @@
 
 - You must never create fallback solutions for configuration settings. In every case a configuration setting is not provided you must raise the appropriate exception. You must never substitute the missing config value with a default or a fallback value.
 - If I ask you to make an exception to the configuration setting rule, you must write this exception in the projects memory file, before you implement it.
+
+- Every time you are asked to solve an issue, you must resolve it AND thoroughly document both the issue and the solution.
+
 </structure-and-conventions>
 
 ## Project-specific exceptions to global rules
@@ -86,9 +89,10 @@ Implementation landed in `src/config/config.ts` (`DEFAULTS` constant +
 
 - **outlook-cli** — CLI that authenticates against Outlook web via a headed
   Playwright Chrome browser, persists the session under `$HOME/.tool-agents/outlook-cli/`,
-  and exposes 12 subcommands (`login`, `auth-check`, `list-mail`, `get-mail`,
+  and exposes 14 subcommands (`login`, `auth-check`, `list-mail`, `get-mail`,
   `get-thread`, `download-attachments`, `list-calendar`, `get-event`,
-  `list-folders`, `find-folder`, `create-folder`, `move-mail`) over the
+  `list-folders`, `find-folder`, `create-folder`, `move-mail`, `delete-mail`,
+  `create-draft`) over the
   Outlook REST v2.0 API with auto-reauth, secure-by-default file modes, and
   consistent JSON / table output. Full docs: [`docs/tools/outlook-cli.md`](docs/tools/outlook-cli.md).
 <!-- Full XML-format tool documentation lives under docs/tools/<tool>.md per

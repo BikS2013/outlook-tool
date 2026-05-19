@@ -8,6 +8,38 @@ Dates are ISO8601 (local calendar day).
 
 ---
 
+## [Unreleased]
+
+### Added — `get-mail` query mode (`--at`, `--subject`, `--from-address`)
+
+`get-mail` now supports a second lookup mode that locates messages by their
+`ReceivedDateTime` rather than by id. Useful when copying a timestamp
+verbatim from `list-mail` output without round-tripping through the id.
+
+```sh
+# Id mode — unchanged
+outlook-cli get-mail AAMkAGI...
+
+# Query mode — exact ReceivedDateTime equality, optional narrowing
+outlook-cli get-mail --at 2026-05-01T14:32:11Z
+outlook-cli get-mail --at 2026-05-01T14:32:11Z --subject "Q4 review"
+outlook-cli get-mail --at "now-1d" --from-address alice@example.com
+```
+
+- `--at` accepts ISO8601 or the existing `now` / `now±Nd` keyword grammar.
+- `--subject` runs as `contains(Subject,'…')` (server-side, case-sensitive).
+- `--from-address` runs as `tolower(From/EmailAddress/Address) eq '…'`
+  (case-insensitive exact equality).
+- Returns `Message[]` (every match, capped at 50, sorted
+  `ReceivedDateTime desc`) with the same per-element shape as id mode
+  (Body + Attachments included).
+- `<id>` and `--at` are mutually exclusive; `--subject` / `--from-address`
+  require `--at`. Violations raise `BAD_USAGE` (exit 2).
+
+No changes to id-mode behaviour or output.
+
+---
+
 ## [3.1.1] — 2026-04-30
 
 ### Fixed — `playwright` moved to `dependencies` (was in `devDependencies`)

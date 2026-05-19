@@ -31,6 +31,30 @@ export interface Body {
   Content: string;
 }
 
+export type DraftBodyContentType = 'HTML' | 'Text';
+export type DraftImportance = 'Low' | 'Normal' | 'High';
+
+export interface DraftEmailAddress {
+  Address: string;
+  Name?: string;
+}
+
+export interface DraftRecipient {
+  EmailAddress: DraftEmailAddress;
+}
+
+export interface CreateDraftMessageRequest {
+  Subject: string;
+  Body: {
+    ContentType: DraftBodyContentType;
+    Content: string;
+  };
+  ToRecipients: DraftRecipient[];
+  CcRecipients?: DraftRecipient[];
+  BccRecipients?: DraftRecipient[];
+  Importance?: DraftImportance;
+}
+
 // ---------------------------------------------------------------------------
 // Mail
 // ---------------------------------------------------------------------------
@@ -66,6 +90,38 @@ export interface Message extends MessageSummary {
   SentDateTime?: string;
   /** Added by get-mail via a separate request to /attachments. */
   Attachments?: AttachmentSummary[];
+}
+
+/**
+ * Draft creation responses are message resources, but some properties that
+ * are required on read/list responses can be null or absent while the message
+ * is still being composed.
+ */
+export interface DraftMessage {
+  Id: string;
+  Subject?: string;
+  Body?: Body;
+  BodyPreview?: string;
+  Importance?: DraftImportance;
+  ParentFolderId?: string;
+  From?: Recipient | null;
+  Sender?: Recipient | null;
+  ToRecipients?: Recipient[];
+  CcRecipients?: Recipient[];
+  BccRecipients?: Recipient[];
+  ReplyTo?: Recipient[];
+  ReceivedDateTime?: string;
+  SentDateTime?: string;
+  LastModifiedDateTime?: string;
+  CreatedDateTime?: string;
+  HasAttachments?: boolean;
+  IsDeliveryReceiptRequested?: boolean;
+  IsReadReceiptRequested?: boolean;
+  IsRead?: boolean;
+  IsDraft?: boolean;
+  WebLink?: string;
+  ConversationId?: string;
+  InternetMessageId?: string;
 }
 
 // ---------------------------------------------------------------------------

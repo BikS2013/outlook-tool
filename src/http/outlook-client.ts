@@ -31,6 +31,8 @@ import {
 } from './errors';
 import type {
   FolderCreateRequest,
+  CreateDraftMessageRequest,
+  DraftMessage,
   FolderSummary,
   MessageSummary,
   MoveMessageRequest,
@@ -93,6 +95,23 @@ export interface OutlookClient {
    *              verbatim; all values are URL-encoded.
    */
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
+
+  /**
+   * Create a saved draft message via `POST /api/v2.0/me/messages`.
+   *
+   * This method deliberately only creates the draft. Sending is a separate
+   * Outlook action (`/send`) and is not exposed here.
+   */
+  createDraftMessage(request: CreateDraftMessageRequest): Promise<DraftMessage>;
+
+  /**
+   * Delete a message via `DELETE /api/v2.0/me/messages/{messageId}`.
+   *
+   * Uses the same timeout, header construction, cookie handling, and
+   * 401-retry-once envelope as GET/POST methods. The upstream success response
+   * is expected to be 204 No Content; this method returns void.
+   */
+  deleteMessage(messageId: string): Promise<void>;
 
   /**
    * List direct children of a mail folder via
@@ -236,7 +255,7 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
    * by `listAll` for `@odata.nextLink` follow-through).
    */
   async function doRequest<T>(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'DELETE',
     urlOrPath: string,
     body?: unknown,
   ): Promise<T> {
@@ -312,6 +331,14 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     }
     const url = buildUrl(path, undefined);
     return doRequest<TRes>('POST', url, body);
+  }
+
+  async function doDelete<T>(path: string): Promise<T> {
+    if (!path.startsWith('/')) {
+      throw new Error(`outlook-client: path must start with '/': ${path}`);
+    }
+    const url = buildUrl(path, undefined);
+    return doRequest<T>('DELETE', url);
   }
 
   /**
@@ -517,6 +544,47 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
     }
   }
 
+  async function deleteMessage(messageId: string): Promise<void> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new Error('outlook-client: deleteMessage requires a non-empty messageId');
+    }
+    const path = `/api/v2.0/me/messages/${encodeURIComponent(messageId)}`;
+    try {
+      await doDelete<null>(path);
+    } catch (err) {
+      throw mapHttpToCliError(err);
+    }
+  }
+
+  async function createDraftMessage(
+    request: CreateDraftMessageRequest,
+  ): Promise<DraftMessage> {
+    if (!request || typeof request !== 'object') {
+      throw new Error('outlook-client: createDraftMessage requires a request body');
+    }
+    if (typeof request.Subject !== 'string' || request.Subject.length === 0) {
+      throw new Error('outlook-client: createDraftMessage requires Subject');
+    }
+    if (
+      !request.Body ||
+      typeof request.Body.Content !== 'string' ||
+      request.Body.Content.length === 0
+    ) {
+      throw new Error('outlook-client: createDraftMessage requires Body.Content');
+    }
+    if (!Array.isArray(request.ToRecipients) || request.ToRecipients.length === 0) {
+      throw new Error('outlook-client: createDraftMessage requires ToRecipients');
+    }
+    try {
+      return await doPost<CreateDraftMessageRequest, DraftMessage>(
+        '/api/v2.0/me/messages',
+        request,
+      );
+    } catch (err) {
+      throw mapHttpToCliError(err);
+    }
+  }
+
   async function listMessagesInFolder(
     folderId: string,
     opts: ListMessagesInFolderOptions,
@@ -621,6 +689,8 @@ export function createOutlookClient(opts: CreateClientOptions): OutlookClient {
 
   return {
     get: doGet,
+    createDraftMessage,
+    deleteMessage,
     listFolders,
     getFolder,
     createFolder,
@@ -731,7 +801,7 @@ function buildUrl(
 
 function buildHeaders(
   s: SessionFile,
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'DELETE',
 ): Record<string, string> {
   const rawToken = s.bearer.token ?? '';
   const authValue = rawToken.startsWith('Bearer ')
@@ -799,7 +869,7 @@ function cookieDomainMatches(domain: string): boolean {
 // ---------------------------------------------------------------------------
 
 async function executeFetch(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'DELETE',
   url: string,
   body: unknown,
   s: SessionFile,

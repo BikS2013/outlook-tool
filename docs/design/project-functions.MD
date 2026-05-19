@@ -4,7 +4,7 @@ This document registers every functional requirement and feature of the Outlook 
 Each command exposed by the `outlook-cli` binary is represented as a numbered functional
 requirement (FR-xxx). Source of truth: `docs/design/refined-request-outlook-cli.md`.
 
-Last updated: 2026-04-21
+Last updated: 2026-05-19
 
 ---
 
@@ -42,7 +42,7 @@ are informational, not errors), `3` missing mandatory config, `5` upstream error
 
 **Purpose.** List the user's N most recent messages in a named folder (default `Inbox`),
 ordered by `ReceivedDateTime desc`, optionally filtered by a `ReceivedDateTime` window
-or reduced to a server-side count.
+and/or sender, or reduced to a server-side count.
 
 **Inputs.** `-n, --top <N>` (default 10, range 1..1000), `--folder <name>` (default
 `Inbox`; fast-path well-known set: `Inbox`, `SentItems`, `Drafts`, `DeletedItems`,
@@ -55,9 +55,12 @@ values), `--select <comma-list>` (override selected fields),
 `--from <iso|keyword>` (optional lower bound on `ReceivedDateTime`, inclusive;
 ISO8601 `YYYY-MM-DDTHH:MM:SSZ`, space-separated local-time `YYYY-MM-DD HH:MM:SS`, or
 keyword `now` / `now + Nd` / `now - Nd`), `--to <iso|keyword>` (optional upper bound,
-exclusive; same grammar), `--just-count` (return only the count of matching messages
-via server-side `$count=true`; ignores `--top` and `--select`).
-**REST target.** `GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$top=N&$orderby=ReceivedDateTime desc&$select=...[&$filter=ReceivedDateTime ge X and ReceivedDateTime lt Y]` for the list path;
+exclusive; same grammar), `--from-address <email>` (optional exact
+case-insensitive match on sender email address), `--from-name <name>` (optional
+case-insensitive substring match on sender display name), `--just-count` (return
+only the count of matching messages via server-side `$count=true`; ignores `--top`
+and `--select`).
+**REST target.** `GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$top=N&$orderby=ReceivedDateTime desc&$select=...[&$filter=<date-and-sender-filter>]` for the list path;
 `GET /api/v2.0/me/MailFolders/<folder-or-id>/messages?$count=true&$top=1&$select=Id[&$filter=...]` for the count path.
 **Outputs (JSON).** Array of message summaries (default fields: `Id`, `Subject`, `From`,
 `ReceivedDateTime`, `HasAttachments`, `IsRead`, `WebLink`) — or, when `--just-count` is
@@ -66,24 +69,53 @@ server did not return `@odata.count` and the count reflects only the first page.
 **Outputs (table, `--table`).** Columns `Received | From | Subject | Att | Id` (list mode);
 the count object is rendered as a single-object payload when `--just-count` is set.
 **Exit codes.** `0`, `2` (both `--folder` and `--folder-id`; invalid path; malformed
-`--from`/`--to`), `3`, `4`, `5` (`UPSTREAM_FOLDER_NOT_FOUND` on bad path / id), `6`.
+`--from`/`--to`; empty sender filters), `3`, `4`, `5`
+(`UPSTREAM_FOLDER_NOT_FOUND` on bad path / id), `6`.
 **Source.** Refined request §5.3 + folder extension refined-request-folders §5.5 +
-CHANGELOG [1.2.0] (date window) + [1.3.0] (just-count, --top cap 1..1000).
+CHANGELOG [1.2.0] (date window) + [1.3.0] (just-count, --top cap 1..1000) +
+`docs/reference/refined-request-list-mail-sender-filter.md`.
 
 ---
 
-## FR-004 — `outlook-cli get-mail <id>`
+## FR-004 — `outlook-cli get-mail [<id>] [--at <ts> [--subject <text>] [--from-address <email>]]`
 
-**Purpose.** Retrieve the full resource for a specific message, plus a computed
+**Purpose.** Retrieve the full resource for a specific message (id mode) or for
+every message that arrived at a precise instant (query mode), plus a computed
 `Attachments[]` metadata summary.
 
-**Inputs.** `<id>` positional (required), `--body <html|text|none>` (default `text`).
-**REST targets.** `GET /api/v2.0/me/messages/{id}` and
-`GET /api/v2.0/me/messages/{id}/attachments` (metadata only).
-**Outputs (JSON).** Full message resource augmented with
-`Attachments: [{ Id, Name, ContentType, Size, IsInline }, ...]`.
-**Exit codes.** `0`, `2` (missing id), `3`, `4`, `5`, `6`.
-**Source.** Refined request §5.4.
+**Inputs.**
+- `<id>` positional (optional). When supplied, runs in **id mode**.
+- `--at <ts>` (optional). Triggers **query mode** — server-side
+  `$filter=ReceivedDateTime eq <iso>` against `/api/v2.0/me/messages` (all
+  folders). Accepts ISO8601 or the keyword grammar `now` / `now±Nd`. Exact
+  equality, no tolerance window.
+- `--subject <text>` (optional, query-mode only). Adds `contains(Subject,'…')`
+  to the filter (case-sensitive).
+- `--from-address <email>` (optional, query-mode only). Adds
+  `tolower(From/EmailAddress/Address) eq '…'` (case-insensitive).
+- `--body <html|text|none>` (default `text`). Applied to every returned
+  message.
+
+Exactly one of `<id>` / `--at` must be supplied; passing both, or passing
+`--subject`/`--from-address` without `--at`, raises `BAD_USAGE` (exit 2).
+A malformed `--at` timestamp raises the same error.
+
+**REST targets.**
+- Id mode: `GET /api/v2.0/me/messages/{id}` and
+  `GET /api/v2.0/me/messages/{id}/attachments`.
+- Query mode: `GET /api/v2.0/me/messages?$filter=…&$select=Id,Subject,From,
+  ReceivedDateTime&$orderby=ReceivedDateTime desc&$top=50` followed by the
+  id-mode pair for every match (so each array element has identical shape).
+
+**Outputs (JSON).**
+- Id mode: full message resource augmented with
+  `Attachments: [{ Id, Name, ContentType, Size, IsInline }, ...]`.
+- Query mode: array of the same shape, ordered `ReceivedDateTime desc`.
+  Empty array on no match. Capped at 50 matches per call.
+
+**Exit codes.** `0`, `2` (missing both id and `--at`; both supplied; subject/
+from-address without `--at`; malformed `--at`), `3`, `4`, `5`, `6`.
+**Source.** Refined request §5.4 + 2026-05-02 query-mode extension.
 
 ---
 
@@ -144,8 +176,10 @@ or the full sub-tree when `--recursive` is set. Part of the folder-management ex
 
 **Inputs.** `--parent <name-or-path-or-id>` (default `MsgFolderRoot`; accepts well-known
 alias, display-name path, or `id:AAMkAGI...`), `--recursive` (default `false`),
-`--include-hidden` (default `false`), `--top <N>` (default `100`, range `1..250` —
-`$top` hint per `/childfolders` page; actual paging handled by the HTTP layer).
+`--include-hidden` (default `false`), `--contains <substring>` (optional,
+case-insensitive substring filter applied to the emitted `Path`), `--top <N>`
+(default `100`, range `1..250` — `$top` hint per `/childfolders` page; actual
+paging handled by the HTTP layer).
 **REST targets.** `GET /api/v2.0/me/MailFolders?$top=N&$select=...` for the root level;
 `GET /api/v2.0/me/MailFolders/{parentId}/childfolders?$top=N&$select=...` for children.
 Pagination follows `@odata.nextLink` up to a 50-page cap per collection; whole-tree
@@ -155,13 +189,15 @@ TotalItemCount,WellKnownName,CreatedDateTime,IsHidden`.
 **Outputs (JSON).** Array of `FolderSummary`: `{ Id, DisplayName, ParentFolderId,
 ChildFolderCount, UnreadItemCount, TotalItemCount, WellKnownName?, Path }`. `Path` is
 materialized client-side from parent down using `/` separators (with `\/` and `\\`
-escapes inside segments).
+escapes inside segments). When `--contains` is supplied, only rows whose materialized
+`Path` includes the NFC-normalized substring case-insensitively are returned.
 **Outputs (table, `--table`).** Columns `Path | Unread | Total | Children | Id` (no
 truncation on `Id`).
-**Exit codes.** `0`, `2` (bad flag value / invalid parent), `3`, `4`, `5`
+**Exit codes.** `0`, `2` (bad flag value / invalid parent / empty `--contains`), `3`, `4`, `5`
 (`UPSTREAM_FOLDER_NOT_FOUND` on bad parent; `UPSTREAM_PAGINATION_LIMIT` on cap
 exceeded), `6`.
-**Source.** Refined-request-folders §5.1.
+**Source.** Refined-request-folders §5.1 +
+`docs/reference/refined-request-list-folders-substring.md`.
 
 ---
 
@@ -276,6 +312,54 @@ upstream message has no ConversationId), `3`, `4`, `5` (upstream error on either
 
 ---
 
+## FR-013 — `outlook-cli delete-mail <messageIds...>`
+
+**Purpose.** Delete one or more messages by Outlook message id. The operation is
+explicitly destructive and therefore requires `--yes`.
+
+**Inputs.** `<messageIds...>` positional (one or more message ids), `--yes`
+(required confirmation guard), `--continue-on-error` (default `false`; when set,
+per-id failures are collected into `failed[]` and later ids are still attempted).
+**REST target.** `DELETE /api/v2.0/me/messages/{id}` once per id, sequentially.
+**Outputs (JSON).** `{ deleted: [{ id }, ...], failed: [{ id, error: { code,
+httpStatus?, message? } }, ...], summary: { requested, deleted, failed } }`.
+**Outputs (table, `--table`).** Columns `Id | Status | Error`.
+**Exit codes.** `0` (all deleted), `2` (missing ids, empty id, or missing `--yes`),
+`3`, `4`, `5` (upstream failure; partial failure with `--continue-on-error` still
+exits `5` after emitting the result), `6`.
+**Source.** `docs/reference/refined-request-delete-mail-by-id.md`,
+`docs/design/plan-005-delete-mail.md`, and
+`docs/research/outlook-v2-delete-message.md`.
+
+---
+
+## FR-014 — `outlook-cli create-draft`
+
+**Purpose.** Create a saved email draft in the authenticated user's Outlook mailbox
+so the user can review and send it manually through the Outlook UI. The command is
+draft-only and never calls a send endpoint.
+
+**Inputs.** `--to <emails>` (required, comma-separated; also accepts `Name
+<email@example.com>` tokens), `--cc <emails>` (optional), `--bcc <emails>`
+(optional), `--subject <text>` (required), either `--body <text>` or
+`--body-file <path>` (exactly one required), `--body-type <text|html>` (default
+`text`), and `--importance <low|normal|high>` (optional).
+**REST target.** `POST /api/v2.0/me/messages` with a writable message payload:
+`Subject`, `Body`, `ToRecipients`, optional `CcRecipients`, optional
+`BccRecipients`, and optional `Importance`. This is the documented Drafts shortcut;
+the separate `POST /api/v2.0/me/messages/{id}/send` action remains out of scope.
+**Outputs (JSON).** `{ id, subject, isDraft, importance, to, cc, bcc, webLink,
+createdDateTime, lastModifiedDateTime, sentDateTime }`.
+**Outputs (table, `--table`).** Columns `Subject | To | Draft | Id`.
+**Exit codes.** `0`, `2` (missing/invalid recipients, subject, body source,
+body type, or importance; both `--body` and `--body-file`), `3`, `4`, `5`
+(upstream error or malformed success response), `6` (body file read error).
+**Source.** `docs/reference/refined-request-create-draft-email.md`,
+`docs/design/plan-006-create-draft-email.md`, and
+`docs/research/outlook-v2-create-draft-message.md`.
+
+---
+
 ## Cross-cutting features
 
 ### FF-001 — Global output modes
@@ -364,4 +448,3 @@ implementation.
 
 See `CHANGELOG.md` 3.0.0 for the breaking-change record. The historical
 specs are preserved at git tag `v2.1.0`.
-

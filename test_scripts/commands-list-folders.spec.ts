@@ -351,6 +351,70 @@ describe('list-folders: run()', () => {
     expect(rows.map((r) => r.Id).sort()).toEqual(['h', 'v']);
   });
 
+  it('(8c) --contains filters direct children by emitted Path case-insensitively', async () => {
+    const listFolders = vi.fn(async () => [
+      folder({ Id: 'p', DisplayName: 'Projects' }),
+      folder({ Id: 'a', DisplayName: 'Archive' }),
+      folder({ Id: 'q', DisplayName: 'Quarterly Reports' }),
+    ]);
+    const { deps } = buildDeps({
+      listFolders: listFolders as OutlookClient['listFolders'],
+    });
+
+    const rows = await runListFolders(deps, { contains: 'REP' });
+
+    expect(listFolders).toHaveBeenCalledTimes(1);
+    expect(rows.map((r) => r.Id)).toEqual(['q']);
+    expect(rows[0].Path).toBe('Quarterly Reports');
+  });
+
+  it('(8d) --recursive --contains filters by materialized nested path', async () => {
+    const listFolders = vi.fn(async (parentId: string) => {
+      if (parentId === 'MsgFolderRoot') {
+        return [
+          folder({ Id: 'clients', DisplayName: 'Clients', ChildFolderCount: 1 }),
+          folder({ Id: 'archive', DisplayName: 'Archive', ChildFolderCount: 0 }),
+        ];
+      }
+      if (parentId === 'clients') {
+        return [
+          folder({ Id: 'alpha', DisplayName: 'Alpha', ChildFolderCount: 0 }),
+        ];
+      }
+      return [];
+    });
+    const { deps } = buildDeps({
+      listFolders: listFolders as OutlookClient['listFolders'],
+    });
+
+    const rows = await runListFolders(deps, {
+      recursive: true,
+      contains: 'clients/alpha',
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      Id: 'alpha',
+      Path: 'Clients/Alpha',
+      Depth: 1,
+    });
+  });
+
+  it('(8e) --contains rejects empty or whitespace-only values before any REST call', async () => {
+    const listFolders = vi.fn(async () => []);
+    const getFolder = vi.fn(async () => folder({ Id: 'x', DisplayName: 'x' }));
+    const { deps } = buildDeps({
+      listFolders: listFolders as OutlookClient['listFolders'],
+      getFolder: getFolder as OutlookClient['getFolder'],
+    });
+
+    await expect(runListFolders(deps, { contains: '   ' })).rejects.toBeInstanceOf(
+      UsageError,
+    );
+    expect(listFolders).not.toHaveBeenCalled();
+    expect(getFolder).not.toHaveBeenCalled();
+  });
+
   it('(9) UpstreamError from the client propagates (mapped by mapHttpError, same taxonomy)', async () => {
     const upstream = new UpstreamError({
       code: 'UPSTREAM_HTTP_503',

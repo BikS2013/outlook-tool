@@ -118,6 +118,7 @@ interface StubClient extends OutlookClient {
   getFolder: ReturnType<typeof vi.fn>;
   createFolder: ReturnType<typeof vi.fn>;
   moveMessage: ReturnType<typeof vi.fn>;
+  deleteMessage: ReturnType<typeof vi.fn>;
   listMessagesInFolder: ReturnType<typeof vi.fn>;
 }
 
@@ -137,6 +138,9 @@ function makeStubClient(): StubClient {
     }),
     moveMessage: vi.fn(async () => {
       throw new Error('stub: client.moveMessage not configured for this test');
+    }),
+    deleteMessage: vi.fn(async () => {
+      throw new Error('stub: client.deleteMessage not configured for this test');
     }),
     listMessagesInFolder: vi.fn(async () => {
       throw new Error(

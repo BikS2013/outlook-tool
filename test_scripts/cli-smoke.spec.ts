@@ -72,6 +72,7 @@ describe('cli smoke tests', () => {
     expect(out).toContain('find-folder');
     expect(out).toContain('create-folder');
     expect(out).toContain('move-mail');
+    expect(out).toContain('create-draft');
   });
 
   it('(1a) list-folders --help exposes the --parent, --recursive, --first-match flags', () => {
@@ -89,6 +90,17 @@ describe('cli smoke tests', () => {
     const out = r.stdout;
     expect(out).toContain('--to');
     expect(out).toContain('--continue-on-error');
+  });
+
+  it('(1c) create-draft --help exposes recipient, subject, and body flags', () => {
+    const r = runCli(['create-draft', '--help'], { env: clearedConfigEnv() });
+    expect(r.status).toBe(0);
+    const out = r.stdout;
+    expect(out).toContain('--to');
+    expect(out).toContain('--subject');
+    expect(out).toContain('--body');
+    expect(out).toContain('--body-file');
+    expect(out).toContain('--body-type');
   });
 
   it('(2) --version prints a semver and exits 0', () => {

@@ -106,14 +106,43 @@
                    `{ count, exact }` when `--just-count` is set.
            - Table columns: `Received | From | Subject | Att | Id` (default).
 
-        4. `get-mail <id> [--body <html|text|none>]`
-           - Retrieves one message. `id` is positional and required.
+        4. `get-mail [<id>] [--body <html|text|none>]
+                     [--at <ts> [--subject <text>] [--from-address <email>]]`
+           - Two lookup modes — exactly one must be used:
+               · **By id** — pass `<id>` as the positional argument. Returns
+                 a single `Message` (legacy behaviour).
+               · **By query** — omit `<id>` and pass `--at <timestamp>`.
+                 Returns an array of full `Message` objects.
            - `--body`     `html` (raw HTML Body passed through),
                           `text` (default; upstream Body passed through untouched
                            — HTML→text conversion is deferred),
-                          `none` (omit the Body field).
-           - Fetches `/api/v2.0/me/messages/{id}` plus `.../attachments` metadata
-             and merges them as `Attachments: AttachmentSummary[]` on the result.
+                          `none` (omit the Body field). Applied to every
+                          returned message in both modes.
+           - `--at <ts>`            ISO8601 timestamp or `now`/`now±Nd`. Server-
+                                   side filter `ReceivedDateTime eq <iso>` —
+                                   exact equality, no tolerance window. Useful
+                                   when copying a `ReceivedDateTime` value
+                                   verbatim from `list-mail`.
+           - `--subject <text>`    Optional. Server-side `contains(Subject,'…')`
+                                   to narrow the `--at` match. Case-sensitive.
+                                   Requires `--at`.
+           - `--from-address <em>` Optional. Server-side
+                                   `tolower(From/EmailAddress/Address) eq '…'`
+                                   to narrow the `--at` match (case-insensitive
+                                   exact equality). Requires `--at`.
+           - In id-mode, fetches `/api/v2.0/me/messages/{id}` plus
+             `.../attachments` and merges the attachment metadata as
+             `Attachments: AttachmentSummary[]`. In query-mode, the same
+             id-mode fetch is performed for every match (so the array elements
+             have identical shape to id-mode output).
+           - Multi-match: query-mode returns every match (sorted
+             `ReceivedDateTime desc`) — capped server-side at 50 to protect
+             against pathological inputs. Empty array means no match.
+           - Validation errors (exit 2): missing both `<id>` and `--at`;
+             passing both; passing `--subject` / `--from-address` without
+             `--at`; malformed `--at` timestamp.
+           - Table columns (query-mode): `Received | From | Subject | Id`
+             (same layout as `get-thread`).
 
         5. `get-thread <id> [--body <html|text|none>] [--order <asc|desc>]`
            - Retrieves every message in the conversation (thread) that `id`
@@ -143,7 +172,27 @@
            - Output: `{messageId, outDir, saved:[{id,name,path,size}],
                       skipped:[{id,name,reason,sourceUrl?,odataType?}]}`.
 
-        7. `list-calendar [--from <ISO>] [--to <ISO>] [--tz <iana>]`
+        7. `create-draft --to <emails> --subject <text> (--body <text> | --body-file <path>)`
+           - Creates a saved draft email in Outlook. It does **not** send the
+             message; the user reviews and sends it manually in the Outlook UI.
+           - Calls `POST /api/v2.0/me/messages`, the documented Drafts shortcut.
+             The `/send` action is intentionally not exposed.
+           - `--to <emails>`       Required comma-separated To recipients.
+                                    Each token can be `email@example.com` or
+                                    `Name <email@example.com>`.
+           - `--cc <emails>`       Optional comma-separated Cc recipients.
+           - `--bcc <emails>`      Optional comma-separated Bcc recipients.
+           - `--subject <text>`    Required non-empty subject.
+           - `--body <text>`       Inline body content.
+           - `--body-file <path>`  Read UTF-8 body content from a file.
+                                    Mutually exclusive with `--body`.
+           - `--body-type <mode>`  `text` (default) or `html`.
+           - `--importance <mode>` `low`, `normal`, or `high`.
+           - JSON: `{ id, subject, isDraft, importance, to, cc, bcc, webLink,
+                      createdDateTime, lastModifiedDateTime, sentDateTime }`.
+           - Table columns: `Subject | To | Draft | Id`.
+
+        8. `list-calendar [--from <ISO>] [--to <ISO>] [--tz <iana>]`
            - `--from` accepts ISO8601, `now`, or `now + Nd` (default `now`).
            - `--to`   accepts ISO8601, `now`, or `now + Nd` (default `now + 7d`).
            - Calls `GET /api/v2.0/me/calendarview?startDateTime=...&endDateTime=...
@@ -152,10 +201,10 @@
            - JSON: array of `EventSummary`.
            - Table columns: `Start | End | Subject | Organizer | Location | Id`.
 
-        8. `get-event <id> [--body <html|text|none>]`
+        9. `get-event <id> [--body <html|text|none>]`
            - Retrieves a single event. Body handling identical to get-mail.
 
-        9. `list-folders [--parent <spec>] [--top <N>] [--recursive] [--include-hidden] [--first-match]`
+        10. `list-folders [--parent <spec>] [--top <N>] [--recursive] [--include-hidden] [--contains <substring>] [--first-match]`
            - Enumerates mail folders under a parent.
            - `--parent <spec>`   Well-known alias, display-name path, or
                                  `id:<raw>`. Default `MsgFolderRoot`.
@@ -167,13 +216,18 @@
                                  becomes `\\`).
            - `--include-hidden`  Include folders whose `IsHidden === true`.
                                  Default: false.
+           - `--contains <text>` Case-insensitive substring filter applied to
+                                 each materialized `Path` after traversal and
+                                 hidden-folder filtering. Use with
+                                 `--recursive` to search the whole mailbox tree
+                                 for folders such as `hirings`.
            - `--first-match`     On ambiguity during `--parent` resolution,
                                  pick the oldest candidate (`CreatedDateTime`
                                  ascending, `Id` ascending) instead of exit 2.
            - JSON: array of `FolderSummary` objects with a materialized `Path`.
            - Table columns: `Path | Unread | Total | Children | Id`.
 
-        10. `find-folder <spec> [--anchor <spec>] [--first-match]`
+        11. `find-folder <spec> [--anchor <spec>] [--first-match]`
            - Resolves a folder query to a single `ResolvedFolder` (including
              the resolver's provenance in `ResolvedVia`).
            - `<spec>` (required) — one of:
@@ -192,7 +246,7 @@
            - JSON: single `ResolvedFolder` object with `ResolvedVia:
              "wellknown" | "path" | "id"`.
 
-        11. `create-folder <path-or-name> [--parent <spec>] [--create-parents] [--idempotent]`
+        12. `create-folder <path-or-name> [--parent <spec>] [--create-parents] [--idempotent]`
            - Creates a folder (or a nested path) under an anchor.
            - `<path-or-name>` (required) — a bare name (`Alpha`) or a
              slash-separated display-name path (`Projects/Alpha`). A well-known
@@ -217,7 +271,7 @@
            - Table columns: `Path | Id | PreExisting` (applied to
              `result.created[]`).
 
-        12. `move-mail <messageIds...> --to <spec> [--first-match] [--continue-on-error]`
+        13. `move-mail <messageIds...> --to <spec> [--first-match] [--continue-on-error]`
            - Moves one or more messages to a destination folder.
            - **IMPORTANT — move returns a NEW id.** Outlook's
              `POST /me/messages/{id}/move` responds with a new message
@@ -239,6 +293,16 @@
              `{ sourceId, error:{ code, httpStatus?, message? } }`), and a
              `summary: { requested, moved, failed }`.
            - Table columns: `Source Id | New Id | Status | Error`.
+
+        14. `delete-mail <messageIds...> --yes [--continue-on-error]`
+           - Deletes one or more messages by Outlook message id.
+           - `--yes` is required so accidental invocations do not delete mail.
+           - `--continue-on-error` collects per-message failures in `failed[]`
+             instead of aborting on the first failed id. The process exits 5
+             when any failure is reported.
+           - JSON: `DeleteMailResult` with `deleted[]`, `failed[]`, and
+             `summary: { requested, deleted, failed }`.
+           - Table columns: `Id | Status | Error`.
 
         Folder error codes (additional to the generic upstream taxonomy):
           - `UPSTREAM_FOLDER_NOT_FOUND`   — exit 5 (folder or path segment
@@ -273,6 +337,16 @@
         npx ts-node src/cli.ts download-attachments AAMkAGI... --out ./att
         ```
 
+        Create a draft for manual review and sending in Outlook:
+        ```bash
+        npx ts-node src/cli.ts create-draft \
+          --to "Bob <bob@example.com>,carol@example.com" \
+          --subject "Planning notes" \
+          --body-file ./draft-body.html \
+          --body-type html \
+          --importance normal
+        ```
+
         Calendar:
         ```bash
         npx ts-node src/cli.ts list-calendar --from now --to "now + 14d" --table
@@ -284,6 +358,9 @@
         # Top-level folders; recursive walk with --table
         npx ts-node src/cli.ts list-folders --table
         npx ts-node src/cli.ts list-folders --parent Inbox --recursive --table
+
+        # Search the whole folder tree by path substring (e.g. "hirings")
+        npx ts-node src/cli.ts list-folders --recursive --contains hirings --table
 
         # Resolve a path to an id
         npx ts-node src/cli.ts find-folder "Inbox/Projects/Alpha" --json
@@ -299,6 +376,9 @@
         # Move messages (surface the new ids in moved[])
         npx ts-node src/cli.ts move-mail AAMkAGI...srcA AAMkAGI...srcB \
           --to "Inbox/Projects/Alpha" --continue-on-error
+
+        # Delete messages by id (requires --yes)
+        npx ts-node src/cli.ts delete-mail AAMkAGI... --yes
         ```
 
         Security notes:

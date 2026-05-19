@@ -61,6 +61,11 @@ export interface ListFoldersOptions {
    * raising `UsageError('FOLDER_AMBIGUOUS')`. Default: false.
    */
   firstMatch?: boolean;
+  /**
+   * Optional case-insensitive substring filter applied to the emitted Path
+   * after folder rows are materialized.
+   */
+  contains?: string;
 }
 
 /** Row shape emitted by `run()` — wire `FolderSummary` plus an always-populated
@@ -93,6 +98,7 @@ export async function run(
   const recursive = opts.recursive === true;
   const includeHidden = opts.includeHidden === true;
   const firstMatch = opts.firstMatch === true;
+  const contains = resolveContains(opts.contains);
 
   // Resolve parent. The default (`MsgFolderRoot`) short-circuits without a
   // REST hop — `client.listFolders` accepts the alias verbatim in the URL
@@ -119,10 +125,10 @@ export async function run(
   }
 
   try {
-    if (!recursive) {
-      return await listDirectChildren(client, parentId, top, includeHidden);
-    }
-    return await listRecursive(client, parentId, top, includeHidden);
+    const rows = !recursive
+      ? await listDirectChildren(client, parentId, top, includeHidden)
+      : await listRecursive(client, parentId, top, includeHidden);
+    return filterByContains(rows, contains);
   } catch (err) {
     throw mapHttpError(err);
   }
@@ -214,6 +220,29 @@ function resolveTop(raw: number | undefined): number {
     );
   }
   return raw;
+}
+
+function resolveContains(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    throw new UsageError('list-folders: --contains must not be empty');
+  }
+  return normalizeForContains(trimmed);
+}
+
+function filterByContains(
+  rows: ListFoldersRow[],
+  contains: string | undefined,
+): ListFoldersRow[] {
+  if (contains === undefined) return rows;
+  return rows.filter((row) =>
+    normalizeForContains(row.Path ?? row.DisplayName ?? '').includes(contains),
+  );
+}
+
+function normalizeForContains(value: string): string {
+  return value.normalize('NFC').toLocaleLowerCase('en-US');
 }
 
 function isNotHidden(f: FolderSummary): boolean {
